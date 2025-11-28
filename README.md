@@ -66,13 +66,12 @@ If you encounter a problem or have a question, please either open an issue in th
 ## Citation
 If you find this work useful, please cite:
 ```bibtex
-@misc{kmicikiewicz2025prosperoactivelearningrobust,
-      title={ProSpero: Active Learning for Robust Protein Design Beyond Wild-Type Neighborhoods}, 
-      author={Michal Kmicikiewicz and Vincent Fortuin and Ewa Szczurek},
-      year={2025},
-      eprint={2505.22494},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2505.22494}, 
+@inproceedings{
+kmicikiewicz2025prospero,
+title={ProSpero: Active Learning for Robust Protein Design Beyond Wild-Type Neighborhoods},
+author={Michal Kmicikiewicz and Vincent Fortuin and Ewa Szczurek},
+booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+year={2025},
+url={https://openreview.net/forum?id=wSDE3karoF}
 }
 ```
