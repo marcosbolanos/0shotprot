@@ -94,17 +94,20 @@ def run_iter(args, logger):
     starting_sequence = WT_SEQUENCES[args.task]
 
     for e in range(args.n_iters):
+        # This class implements algos 2, 3 & 4
         sampler = ProteinSampler(model, tokenizer_oadm, alphabet)
         sequences = list()
-        ref_sequences = dataset.train.tolist() + dataset.valid.tolist()
+        ref_sequences = dataset.train.tolist() + dataset.valid.tolist() # So we don't regenerate smth that's already in
         # generate new sequences
-        while len(sequences) < args.n_queries:
+        while len(sequences) < args.n_queries: # n_queries is K
+            # This method sequentially runs targeted masking, then SMC
             sampler.generate_raa_from_alanine_scan(
                 proxy, starting_sequence, args.batch_size, args.resampling_steps, args.min_corruptions, 
                 args.max_corruptions, args.kappa_scan, args.n_checks_multiplier, args.kappa_guidance, 
             )
+            # This method is inherited from parent Sampler class
             sequences += sampler.get_top_sequences(args.n_queries, ref_sequences)
-            ref_sequences += sequences
+            ref_sequences += sequences # add sequences to those we've already seen
 
         sequences = sequences[:args.n_queries]
         assert len(sequences) == args.n_queries
