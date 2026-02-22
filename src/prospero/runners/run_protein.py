@@ -1,6 +1,6 @@
 import sys
 import os
-from evodiff.pretrained import OA_DM_38M
+from evodiff.pretrained import OA_DM_38M  # type: ignore[reportMissingImports]
 from prospero.experiments_config import ALPHABETS, WT_SEQUENCES
 
 
@@ -8,7 +8,7 @@ from prospero.utils import set_seed, get_new_starting_seq, get_new_starting_seq_
 from prospero.experiment_tracker import ExperimentTracker
 from prospero.inference import ProteinSampler
 
-from prospero.surrogate import Ensemble, ConvolutionalNetworkModel
+from prospero.surrogate import Ensemble, build_surrogate_model
 from prospero.dataset import RegressionDataset
 from prospero.landscapes import get_landscape
 
@@ -18,19 +18,20 @@ import numpy as np
 from copy import deepcopy
 
 import logging
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stdout,
-    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
-    datefmt='%H:%M:%S',
+    format="%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
 )
 
 
 def get_parser():
     parser = argparse.ArgumentParser(
         description="Unified Argument Parser for Oracle, Dataset, and Proxy Arguments",
-        formatter_class=ArgumentDefaultsHelpFormatter
+        formatter_class=ArgumentDefaultsHelpFormatter,
     )
 
     # Experiment arguments
@@ -59,9 +60,29 @@ def get_parser():
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--epochs_per_valid", type=int, default=1)
     parser.add_argument("--proxy_batch_size", type=int, default=256)
+    parser.add_argument(
+        "--surrogate_arch",
+        type=str,
+        choices=["cnn", "esm_transformer"],
+        default="cnn",
+    )
+    parser.add_argument(
+        "--esm_model_name",
+        type=str,
+        default="facebook/esm2_t6_8M_UR50D",
+    )
+    parser.add_argument("--esm_attention_heads", type=int, default=4)
+    parser.add_argument("--esm_attention_dropout", type=float, default=0.1)
+    parser.add_argument("--esm_mlp_hidden_dim", type=int, default=256)
+    parser.add_argument("--esm_mlp_dropout", type=float, default=0.25)
+    parser.add_argument(
+        "--esm_max_length",
+        type=int,
+        default=None,
+        help="Optional max tokenized sequence length for ESM inputs",
+    )
 
     return parser
-
 
 
 def run_iter(args, logger):
@@ -79,17 +100,22 @@ def run_iter(args, logger):
     dataset = RegressionDataset(args.task)
 
     proxy = Ensemble(
-        [ConvolutionalNetworkModel(len(wt_sequence), args) for _ in range(args.ensemble_size)]
+        [
+            build_surrogate_model(len(wt_sequence), args)
+            for _ in range(args.ensemble_size)
+        ]
     )
     logger.info("Training started")
     proxy.train(dataset)
     logger.info("Training finished")
-    
+
     alphabet = ALPHABETS[args.alphabet]
-    
+
     model, _, tokenizer_oadm, _ = OA_DM_38M()
     model = model.cuda()
-    exp_tracker = ExperimentTracker(logger, deepcopy(dataset), wt_sequence, best_percentile=0.95)
+    exp_tracker = ExperimentTracker(
+        logger, deepcopy(dataset), wt_sequence, best_percentile=0.95
+    )
 
     starting_sequence = WT_SEQUENCES[args.task]
 
@@ -97,19 +123,28 @@ def run_iter(args, logger):
         # This class implements algos 2, 3 & 4
         sampler = ProteinSampler(model, tokenizer_oadm, alphabet)
         sequences = list()
-        ref_sequences = dataset.train.tolist() + dataset.valid.tolist() # So we don't regenerate smth that's already in
+        ref_sequences = list(dataset.train) + list(
+            dataset.valid
+        )  # So we don't regenerate smth that's already in
         # generate new sequences
-        while len(sequences) < args.n_queries: # n_queries is K
+        while len(sequences) < args.n_queries:  # n_queries is K
             # This method sequentially runs targeted masking, then SMC
             sampler.generate_raa_from_alanine_scan(
-                proxy, starting_sequence, args.batch_size, args.resampling_steps, args.min_corruptions, 
-                args.max_corruptions, args.kappa_scan, args.n_checks_multiplier, args.kappa_guidance, 
+                proxy,
+                starting_sequence,
+                args.batch_size,
+                args.resampling_steps,
+                args.min_corruptions,
+                args.max_corruptions,
+                args.kappa_scan,
+                args.n_checks_multiplier,
+                args.kappa_guidance,
             )
             # This method is inherited from parent Sampler class
             sequences += sampler.get_top_sequences(args.n_queries, ref_sequences)
-            ref_sequences += sequences # add sequences to those we've already seen
+            ref_sequences += sequences  # add sequences to those we've already seen
 
-        sequences = sequences[:args.n_queries]
+        sequences = sequences[: args.n_queries]
         assert len(sequences) == args.n_queries
 
         # eval candidate sequences
@@ -117,14 +152,21 @@ def run_iter(args, logger):
             scores = oracle.get_fitness(np.array(sequences)).tolist()
         else:
             scores = oracle.get_fitness(sequences).tolist()
-        
+
         # append dataset and retrain the surrogate
         dataset.add((sequences, scores))
         exp_tracker.calculate_top_n_metrics((sequences, scores), e + 1, n=100)
-        starting_sequence = get_new_starting_seq(dataset) if not args.task.startswith("D_SHIFT") else get_new_starting_seq_dshift(dataset, args.task)
+        starting_sequence = (
+            get_new_starting_seq(dataset)
+            if not args.task.startswith("D_SHIFT")
+            else get_new_starting_seq_dshift(dataset, args.task)
+        )
 
         proxy = Ensemble(
-            [ConvolutionalNetworkModel(len(wt_sequence), args) for _ in range(args.ensemble_size)]
+            [
+                build_surrogate_model(len(wt_sequence), args)
+                for _ in range(args.ensemble_size)
+            ]
         )
         exp_tracker.save_results(save_path)
         if e + 1 < args.n_iters:
