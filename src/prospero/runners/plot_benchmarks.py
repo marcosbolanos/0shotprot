@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import pickle
+import re
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +49,18 @@ def parse_args():
         "--no_seed_fallback",
         action="store_true",
         help="Disable computing aggregate curves from seed_*.pkl when transformed_results.json is missing.",
+    )
+    parser.add_argument(
+        "--k_task_name",
+        type=str,
+        default="AAV",
+        help="Task name to use for K-comparison plots in nested layouts.",
+    )
+    parser.add_argument(
+        "--k_parent_prefix",
+        type=str,
+        default="n_samples_",
+        help="Directory prefix that identifies K buckets in nested layouts.",
     )
     return parser.parse_args()
 
@@ -164,6 +177,63 @@ def collect_task_data(outputs_dir, allow_seed_fallback=True, excluded_dirs=None)
                 continue
 
         skipped[entry.name] = "no transformed_results.json and no usable seed_*.pkl"
+
+    return task_data, skipped
+
+
+def parse_trailing_int(name):
+    match = re.search(r"(\d+)$", name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def collect_k_task_data(
+    outputs_dir,
+    task_name,
+    parent_prefix="n_samples_",
+    allow_seed_fallback=True,
+    excluded_dirs=None,
+):
+    task_data = {}
+    skipped = {}
+    excluded_dirs = set() if excluded_dirs is None else set(excluded_dirs)
+
+    entries = []
+    for entry in sorted(outputs_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name in excluded_dirs:
+            continue
+        if not entry.name.startswith(parent_prefix):
+            continue
+        entries.append(entry)
+
+    for entry in entries:
+        task_dir = entry / task_name
+        label = entry.name
+        k_value = parse_trailing_int(entry.name)
+        if k_value is not None:
+            label = f"K={k_value}"
+
+        if not task_dir.exists() or not task_dir.is_dir():
+            skipped[entry.name] = f"missing nested task directory {task_name}"
+            continue
+
+        transformed = task_dir / "transformed_results.json"
+        payload = None
+        if transformed.exists():
+            payload = load_from_transformed(transformed)
+        elif allow_seed_fallback:
+            payload = load_from_seeds(task_dir)
+
+        if payload is None:
+            skipped[entry.name] = "no transformed_results.json and no usable seed_*.pkl"
+            continue
+
+        payload["k_value"] = k_value
+        payload["bucket_name"] = entry.name
+        task_data[label] = payload
 
     return task_data, skipped
 
@@ -400,6 +470,41 @@ def save_prospero_reproduction(task_data, out_path, dpi):
     plt.close(fig)
 
 
+def sort_k_labels(k_task_data):
+    items = []
+    for label, payload in k_task_data.items():
+        k_value = payload.get("k_value")
+        rank = float("inf") if k_value is None else float(k_value)
+        items.append((rank, label))
+    return [label for _, label in sorted(items, key=lambda x: (x[0], x[1]))]
+
+
+def save_k_comparison_curve(k_task_data, out_path, dpi, task_name="AAV"):
+    ordered_labels = sort_k_labels(k_task_data)
+    if not ordered_labels:
+        return
+
+    fig, ax = plt.subplots(figsize=(10.5, 6.0), constrained_layout=True)
+    colors = task_colors(ordered_labels)
+
+    for label in ordered_labels:
+        payload = k_task_data[label]
+        x = np.array(payload["iters"], dtype=float)
+        y = payload["mean_max_score"]
+        y_std = payload["mean_max_score_std"]
+        ax.plot(x, y, label=label, color=colors[label], linewidth=2.2)
+        ax.fill_between(x, y - y_std, y + y_std, color=colors[label], alpha=0.16)
+
+    ax.set_title(f"{task_name}: fitness by active learning round across K")
+    ax.set_xlabel("Active learning rounds")
+    ax.set_ylabel("Mean max score")
+    ax.grid(alpha=0.3)
+    ax.legend(title="K", ncol=min(3, len(ordered_labels)), frameon=False)
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
 def write_manifest(task_data, skipped, out_path):
     payload = {
         "tasks_plotted": {
@@ -430,31 +535,69 @@ def main():
         excluded_dirs={args.plots_dirname},
     )
 
-    if not task_data:
+    k_task_data, k_skipped = collect_k_task_data(
+        outputs_dir,
+        task_name=args.k_task_name,
+        parent_prefix=args.k_parent_prefix,
+        allow_seed_fallback=(not args.no_seed_fallback),
+        excluded_dirs={args.plots_dirname},
+    )
+
+    # If the folder is organized in nested K buckets (for example n_samples_*/AAV),
+    # these parent folders are not direct tasks and should not be reported as skipped
+    # by the direct-task collector.
+    if k_task_data:
+        skipped = {
+            name: reason
+            for name, reason in skipped.items()
+            if not name.startswith(args.k_parent_prefix)
+        }
+
+    if not task_data and not k_task_data:
         raise SystemExit(
-            "No plottable task data found. Expected transformed_results.json or seed_*.pkl."
+            "No plottable task data found. Expected direct task dirs or nested K dirs with transformed_results.json or seed_*.pkl."
         )
 
-    save_metric_curves(task_data, plots_dir / "metric_curves_mean_std.png", args.dpi)
-    save_grouped_final_bars(
-        task_data, plots_dir / "final_iteration_grouped_bars.png", args.dpi
-    )
-    save_normalized_gains(task_data, plots_dir / "normalized_gain_curves.png", args.dpi)
-    save_pareto(task_data, plots_dir / "pareto_final_perf_vs_novelty.png", args.dpi)
-    save_convergence(task_data, plots_dir / "convergence_speed.png", args.dpi)
-    save_final_heatmap(
-        task_data, plots_dir / "heatmap_final_metrics_zscore.png", args.dpi
-    )
-    save_prospero_reproduction(
-        task_data, plots_dir / "prospero_maximum_grid.png", args.dpi
-    )
-    write_manifest(task_data, skipped, plots_dir / "plots_manifest.json")
+    if task_data:
+        save_metric_curves(
+            task_data, plots_dir / "metric_curves_mean_std.png", args.dpi
+        )
+        save_grouped_final_bars(
+            task_data, plots_dir / "final_iteration_grouped_bars.png", args.dpi
+        )
+        save_normalized_gains(
+            task_data, plots_dir / "normalized_gain_curves.png", args.dpi
+        )
+        save_pareto(task_data, plots_dir / "pareto_final_perf_vs_novelty.png", args.dpi)
+        save_convergence(task_data, plots_dir / "convergence_speed.png", args.dpi)
+        save_final_heatmap(
+            task_data, plots_dir / "heatmap_final_metrics_zscore.png", args.dpi
+        )
+        save_prospero_reproduction(
+            task_data, plots_dir / "prospero_maximum_grid.png", args.dpi
+        )
+        write_manifest(task_data, skipped, plots_dir / "plots_manifest.json")
+
+    if k_task_data:
+        k_plot_name = f"k_comparison_{args.k_task_name}_mean_max_score.png"
+        save_k_comparison_curve(
+            k_task_data,
+            plots_dir / k_plot_name,
+            args.dpi,
+            task_name=args.k_task_name,
+        )
 
     print(f"Saved plots to: {plots_dir}")
-    print(f"Tasks plotted: {', '.join(sorted(task_data))}")
-    if skipped:
+    if task_data:
+        print(f"Tasks plotted: {', '.join(sorted(task_data))}")
+    if k_task_data:
+        print(f"K-comparison plotted: {', '.join(sort_k_labels(k_task_data))}")
+
+    all_skipped = dict(skipped)
+    all_skipped.update({f"K/{k}": v for k, v in k_skipped.items()})
+    if all_skipped:
         print("Tasks skipped:")
-        for task, reason in sorted(skipped.items()):
+        for task, reason in sorted(all_skipped.items()):
             print(f"- {task}: {reason}")
 
 
