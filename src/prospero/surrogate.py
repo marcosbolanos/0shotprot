@@ -8,6 +8,7 @@ import hashlib
 from pathlib import Path
 from sqlalchemy import LargeBinary, String, Integer, create_engine, select, text  # type: ignore[reportMissingImports]
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column  # type: ignore[reportMissingImports]
+from sqlalchemy.exc import OperationalError  # type: ignore[reportMissingImports]
 from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
 logger = logging.getLogger(__name__)
@@ -95,7 +96,11 @@ class ESMEmbeddingCache:
         self.engine = create_engine(f"sqlite:///{self.cache_path}")
         with self.engine.begin() as connection:
             connection.execute(text("PRAGMA journal_mode=WAL"))
-        Base.metadata.create_all(self.engine)
+        try:
+            Base.metadata.create_all(self.engine)
+        except OperationalError as exc:
+            if "already exists" not in str(exc):
+                raise
 
     def _cache_key(self, sequence):
         cache_input = (

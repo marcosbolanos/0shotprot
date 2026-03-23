@@ -1,15 +1,18 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools<82"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "prospero"
 version = "0.1.0"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "evodiff>=1.1.0",
     "matplotlib>=3.10.8",
     "numpy>=2.4.2",
     "pytest>=9.0.2",
+    "setuptools<82",
+    "tape-proteins",
     "torch>=2.10.0",
     "transformers>=5.3.0",
 ]
