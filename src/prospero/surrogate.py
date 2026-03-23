@@ -481,6 +481,6 @@ class FrozenESMMeanPooledModel:
 
 
 def build_surrogate_model(seq_length, args):
-    if args.surrogate_arch == "esm_transformer":
+    if args.surrogate_arch in {"frozen_esm_mlp"}:
         return FrozenESMMeanPooledModel(args)
     return ConvolutionalNetworkModel(seq_length, args)

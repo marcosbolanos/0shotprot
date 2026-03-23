@@ -63,7 +63,7 @@ def get_parser():
     parser.add_argument(
         "--surrogate_arch",
         type=str,
-        choices=["cnn", "esm_transformer"],
+        choices=["cnn", "frozen_esm_mlp"],
         default="cnn",
     )
     parser.add_argument(
