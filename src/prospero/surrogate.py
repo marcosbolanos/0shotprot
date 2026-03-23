@@ -4,6 +4,10 @@ import torch.nn.functional as F
 import numpy as np
 import sys
 import logging
+import hashlib
+from pathlib import Path
+from sqlalchemy import LargeBinary, String, Integer, create_engine, select, text  # type: ignore[reportMissingImports]
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column  # type: ignore[reportMissingImports]
 from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
 logger = logging.getLogger(__name__)
@@ -42,6 +46,115 @@ def normalize_sequence(sequence):
 
 def normalize_sequences(sequences):
     return [normalize_sequence(sequence) for sequence in sequences]
+
+
+def mean_pool_residue_embeddings(sequence_embeddings, attention_mask):
+    residue_mask = attention_mask.bool()
+    residue_mask[:, 0] = False
+
+    last_token_indices = attention_mask.sum(dim=1).clamp(min=1) - 1
+    residue_mask[
+        torch.arange(residue_mask.size(0), device=residue_mask.device),
+        last_token_indices,
+    ] = False
+
+    residue_mask = residue_mask.unsqueeze(-1).to(sequence_embeddings.dtype)
+    pooled_embeddings = (sequence_embeddings * residue_mask).sum(dim=1)
+    return pooled_embeddings / residue_mask.sum(dim=1).clamp(min=1.0)
+
+
+def get_esm_embedding_cache_path():
+    cache_dir = Path(__file__).resolve().parents[2] / ".cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "esm_embeddings.sqlite3"
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class ESMEmbeddingCacheRow(Base):
+    __tablename__ = "esm_embedding_cache"
+
+    cache_key: Mapped[str] = mapped_column(String, primary_key=True)
+    sequence: Mapped[str] = mapped_column(String, nullable=False)
+    model_name: Mapped[str] = mapped_column(String, nullable=False)
+    max_length: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pooling_name: Mapped[str] = mapped_column(String, nullable=False)
+    embedding_dim: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding_blob: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+
+class ESMEmbeddingCache:
+    def __init__(self, model_name, max_length, embedding_dim):
+        self.cache_path = get_esm_embedding_cache_path()
+        self.model_name = model_name
+        self.max_length = max_length
+        self.embedding_dim = embedding_dim
+        self.pooling_name = "mean_pool_residue_embeddings"
+        self.engine = create_engine(f"sqlite:///{self.cache_path}")
+        with self.engine.begin() as connection:
+            connection.execute(text("PRAGMA journal_mode=WAL"))
+        Base.metadata.create_all(self.engine)
+
+    def _cache_key(self, sequence):
+        cache_input = (
+            f"{self.model_name}|{self.max_length}|{self.pooling_name}|{sequence}"
+        )
+        return hashlib.sha256(cache_input.encode("utf-8")).hexdigest()
+
+    def get_many(self, sequences):
+        if not sequences:
+            return {}, []
+
+        cache_keys = [self._cache_key(sequence) for sequence in sequences]
+        rows_by_key = {}
+        query_batch_size = 900
+        with Session(self.engine) as session:
+            for start in range(0, len(cache_keys), query_batch_size):
+                batch_cache_keys = cache_keys[start : start + query_batch_size]
+                statement = select(ESMEmbeddingCacheRow).where(
+                    ESMEmbeddingCacheRow.cache_key.in_(batch_cache_keys)
+                )
+                batch_rows = session.scalars(statement).all()
+                for row in batch_rows:
+                    rows_by_key[row.cache_key] = row
+
+        embeddings_by_sequence = {}
+        missing_sequences = []
+        for sequence, cache_key in zip(sequences, cache_keys):
+            row = rows_by_key.get(cache_key)
+            if row is None:
+                missing_sequences.append(sequence)
+                continue
+            embedding_array = np.frombuffer(
+                row.embedding_blob, dtype=np.float32
+            ).astype(np.float32)
+            embedding = torch.from_numpy(embedding_array.copy())
+            embeddings_by_sequence[sequence] = embedding
+
+        return embeddings_by_sequence, missing_sequences
+
+    def set_many(self, sequences, embeddings):
+        rows = []
+        for sequence, embedding in zip(sequences, embeddings):
+            embedding_array = embedding.detach().cpu().numpy().astype(np.float32)
+            rows.append(
+                ESMEmbeddingCacheRow(
+                    cache_key=self._cache_key(sequence),
+                    sequence=sequence,
+                    model_name=self.model_name,
+                    max_length=self.max_length,
+                    pooling_name=self.pooling_name,
+                    embedding_dim=self.embedding_dim,
+                    embedding_blob=embedding_array.tobytes(),
+                )
+            )
+
+        with Session(self.engine) as session:
+            for row in rows:
+                session.merge(row)
+            session.commit()
 
 
 class TorchModel:
@@ -161,16 +274,11 @@ class CNN(nn.Module):
 class ESMMeanPooledRegressor(nn.Module):
     def __init__(
         self,
-        model_name,
+        embedding_dim,
         mlp_hidden_dim=128,
         mlp_dropout=0.25,
     ):
         super().__init__()
-        self.esm = AutoModel.from_pretrained(model_name)
-        for param in self.esm.parameters():
-            param.requires_grad = False
-
-        embedding_dim = self.esm.config.hidden_size
         self.mlp = nn.Sequential(
             nn.Linear(embedding_dim, mlp_hidden_dim),
             nn.ReLU(),
@@ -178,43 +286,8 @@ class ESMMeanPooledRegressor(nn.Module):
             nn.Linear(mlp_hidden_dim, 1),
         )
 
-    def _mean_pool_residue_embeddings(self, sequence_embeddings, attention_mask):
-        residue_mask = attention_mask.bool()
-        residue_mask[:, 0] = False
-
-        last_token_indices = attention_mask.sum(dim=1).clamp(min=1) - 1
-        residue_mask[
-            torch.arange(residue_mask.size(0), device=residue_mask.device),
-            last_token_indices,
-        ] = False
-
-        residue_mask = residue_mask.unsqueeze(-1).to(sequence_embeddings.dtype)
-        pooled_embeddings = (sequence_embeddings * residue_mask).sum(dim=1)
-        return pooled_embeddings / residue_mask.sum(dim=1).clamp(min=1.0)
-
-    def forward(self, input_ids, attention_mask):
-        with torch.no_grad():
-            sequence_embeddings = self.esm(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            ).last_hidden_state
-
-        pooled_sequence_embedding = self._mean_pool_residue_embeddings(
-            sequence_embeddings, attention_mask
-        )
-        return self.mlp(pooled_sequence_embedding)
-
-
-class SequenceRegressionDataset(torch.utils.data.Dataset):
-    def __init__(self, sequences, labels):
-        self.sequences = sequences
-        self.labels = labels
-
-    def __len__(self):
-        return len(self.sequences)
-
-    def __getitem__(self, index):
-        return self.sequences[index], self.labels[index]
+    def forward(self, pooled_sequence_embeddings):
+        return self.mlp(pooled_sequence_embeddings)
 
 
 class Ensemble:
@@ -262,8 +335,20 @@ class FrozenESMMeanPooledModel:
         model_name = args.esm_model_name
         self.max_length = args.esm_max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.net = ESMMeanPooledRegressor(
+        self.esm = AutoModel.from_pretrained(model_name).to(self.device)
+        self.esm.eval()
+        for param in self.esm.parameters():
+            param.requires_grad = False
+
+        embedding_dim = self.esm.config.hidden_size
+        self.embedding_dim = embedding_dim
+        self.embedding_cache = ESMEmbeddingCache(
             model_name=model_name,
+            max_length=self.max_length,
+            embedding_dim=embedding_dim,
+        )
+        self.net = ESMMeanPooledRegressor(
+            embedding_dim=embedding_dim,
             mlp_hidden_dim=args.esm_mlp_hidden_dim,
             mlp_dropout=args.esm_mlp_dropout,
         ).to(self.device)
@@ -277,8 +362,11 @@ class FrozenESMMeanPooledModel:
 
     def get_data_loader(self, sequences, labels, shuffle):
         normalized_sequences = normalize_sequences(sequences)
+        pooled_sequence_embeddings = self.get_pooled_sequence_embeddings(
+            normalized_sequences
+        )
         labels = torch.from_numpy(labels).float()
-        dataset = SequenceRegressionDataset(normalized_sequences, labels)
+        dataset = torch.utils.data.TensorDataset(pooled_sequence_embeddings, labels)
         loader = torch.utils.data.DataLoader(
             dataset=dataset, batch_size=self.args.proxy_batch_size, shuffle=shuffle
         )
@@ -295,15 +383,50 @@ class FrozenESMMeanPooledModel:
         encoded = self.tokenizer(sequences, **tokenizer_kwargs)
         return encoded["input_ids"], encoded["attention_mask"]
 
+    def _compute_pooled_sequence_embeddings(self, sequences):
+        if not sequences:
+            return torch.empty((0, self.embedding_dim), dtype=torch.float32)
+
+        pooled_sequence_embeddings = []
+        batch_size = self.args.proxy_batch_size
+        for start in range(0, len(sequences), batch_size):
+            batch_sequences = sequences[start : start + batch_size]
+            input_ids, attention_mask = self._tokenize_batch(batch_sequences)
+            with torch.no_grad():
+                sequence_embeddings = self.esm(
+                    input_ids=input_ids.to(self.device),
+                    attention_mask=attention_mask.to(self.device),
+                ).last_hidden_state
+                batch_embeddings = mean_pool_residue_embeddings(
+                    sequence_embeddings, attention_mask.to(self.device)
+                )
+            pooled_sequence_embeddings.append(batch_embeddings.cpu())
+
+        return torch.cat(pooled_sequence_embeddings, dim=0)
+
+    def get_pooled_sequence_embeddings(self, sequences):
+        unique_sequences = list(dict.fromkeys(sequences))
+        embeddings_by_sequence, missing_sequences = self.embedding_cache.get_many(
+            unique_sequences
+        )
+
+        if missing_sequences:
+            missing_embeddings = self._compute_pooled_sequence_embeddings(
+                missing_sequences
+            )
+            self.embedding_cache.set_many(missing_sequences, missing_embeddings)
+            for sequence, embedding in zip(missing_sequences, missing_embeddings):
+                embeddings_by_sequence[sequence] = embedding
+
+        ordered_embeddings = [
+            embeddings_by_sequence[sequence] for sequence in sequences
+        ]
+        return torch.stack(ordered_embeddings, dim=0)
+
     def compute_loss(self, data):
-        sequences, labels = data
-        input_ids, attention_mask = self._tokenize_batch(sequences)
+        pooled_sequence_embeddings, labels = data
         outputs = torch.squeeze(
-            self.net(
-                input_ids.to(self.device),
-                attention_mask.to(self.device),
-            ),
-            dim=-1,
+            self.net(pooled_sequence_embeddings.to(self.device)), dim=-1
         )
         loss = self.loss_func(outputs, labels.to(self.device))
         return loss
@@ -348,10 +471,11 @@ class FrozenESMMeanPooledModel:
         self.net.eval()
         with torch.no_grad():
             normalized_sequences = normalize_sequences(sequences)
-            input_ids, attention_mask = self._tokenize_batch(normalized_sequences)
+            pooled_sequence_embeddings = self.get_pooled_sequence_embeddings(
+                normalized_sequences
+            )
             predictions = self.net(
-                input_ids.to(self.device),
-                attention_mask.to(self.device),
+                pooled_sequence_embeddings.to(self.device),
             ).squeeze()
         return predictions
 
