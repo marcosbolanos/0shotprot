@@ -333,14 +333,14 @@ class ConvolutionalNetworkModel(TorchModel):
 
 
 class FrozenESMMeanPooledModel:
-    def __init__(self, args, **kwargs):
+    def __init__(self, args, tokenizer=None, esm=None, **kwargs):
         self.args = args
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         model_name = args.esm_model_name
         self.max_length = args.esm_max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.esm = AutoModel.from_pretrained(model_name).to(self.device)
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
+        self.esm = (esm or AutoModel.from_pretrained(model_name)).to(self.device)
         self.esm.eval()
         for param in self.esm.parameters():
             param.requires_grad = False
@@ -485,7 +485,21 @@ class FrozenESMMeanPooledModel:
         return predictions
 
 
-def build_surrogate_model(seq_length, args):
+def build_surrogate_model(seq_length, args, shared_esm_components=None):
     if args.surrogate_arch in {"frozen_esm_mlp"}:
-        return FrozenESMMeanPooledModel(args)
+        tokenizer = None
+        esm = None
+        if shared_esm_components is not None:
+            tokenizer, esm = shared_esm_components
+        return FrozenESMMeanPooledModel(args, tokenizer=tokenizer, esm=esm)
     return ConvolutionalNetworkModel(seq_length, args)
+
+
+def prepare_shared_esm_components(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    tokenizer = AutoTokenizer.from_pretrained(args.esm_model_name)
+    esm = AutoModel.from_pretrained(args.esm_model_name).to(device)
+    esm.eval()
+    for param in esm.parameters():
+        param.requires_grad = False
+    return tokenizer, esm

@@ -8,7 +8,11 @@ from prospero.utils import set_seed, get_new_starting_seq, get_new_starting_seq_
 from prospero.experiment_tracker import ExperimentTracker
 from prospero.inference import ProteinSampler
 
-from prospero.surrogate import Ensemble, build_surrogate_model
+from prospero.surrogate import (
+    Ensemble,
+    build_surrogate_model,
+    prepare_shared_esm_components,
+)
 from prospero.dataset import RegressionDataset
 from prospero.landscapes import get_landscape
 
@@ -97,9 +101,17 @@ def run_iter(args, logger):
     oracle = get_landscape(args.task)
     dataset = RegressionDataset(args.task)
 
+    shared_esm_components = None
+    if args.surrogate_arch in {"frozen_esm_mlp"}:
+        shared_esm_components = prepare_shared_esm_components(args)
+
     proxy = Ensemble(
         [
-            build_surrogate_model(len(wt_sequence), args)
+            build_surrogate_model(
+                len(wt_sequence),
+                args,
+                shared_esm_components=shared_esm_components,
+            )
             for _ in range(args.ensemble_size)
         ]
     )
