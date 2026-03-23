@@ -158,13 +158,11 @@ class CNN(nn.Module):
         return x
 
 
-class ESMTransformerRegressor(nn.Module):
+class ESMMeanPooledRegressor(nn.Module):
     def __init__(
         self,
         model_name,
-        num_attention_heads=4,
-        attention_dropout=0.1,
-        mlp_hidden_dim=256,
+        mlp_hidden_dim=128,
         mlp_dropout=0.25,
     ):
         super().__init__()
@@ -173,43 +171,38 @@ class ESMTransformerRegressor(nn.Module):
             param.requires_grad = False
 
         embedding_dim = self.esm.config.hidden_size
-        self.sequence_attention = nn.MultiheadAttention(
-            embed_dim=embedding_dim,
-            num_heads=num_attention_heads,
-            dropout=attention_dropout,
-            batch_first=True,
-        )
-        self.post_attention_norm = nn.LayerNorm(embedding_dim)
         self.mlp = nn.Sequential(
             nn.Linear(embedding_dim, mlp_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(mlp_dropout),
-            nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
             nn.ReLU(),
             nn.Dropout(mlp_dropout),
             nn.Linear(mlp_hidden_dim, 1),
         )
 
+    def _mean_pool_residue_embeddings(self, sequence_embeddings, attention_mask):
+        residue_mask = attention_mask.bool()
+        residue_mask[:, 0] = False
+
+        last_token_indices = attention_mask.sum(dim=1).clamp(min=1) - 1
+        residue_mask[
+            torch.arange(residue_mask.size(0), device=residue_mask.device),
+            last_token_indices,
+        ] = False
+
+        residue_mask = residue_mask.unsqueeze(-1).to(sequence_embeddings.dtype)
+        pooled_embeddings = (sequence_embeddings * residue_mask).sum(dim=1)
+        return pooled_embeddings / residue_mask.sum(dim=1).clamp(min=1.0)
+
     def forward(self, input_ids, attention_mask):
         with torch.no_grad():
-            token_embeddings = self.esm(
+            sequence_embeddings = self.esm(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
             ).last_hidden_state
 
-        key_padding_mask = attention_mask == 0
-        attended_embeddings, _ = self.sequence_attention(
-            token_embeddings,
-            token_embeddings,
-            token_embeddings,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
+        pooled_sequence_embedding = self._mean_pool_residue_embeddings(
+            sequence_embeddings, attention_mask
         )
-        attended_embeddings = self.post_attention_norm(
-            attended_embeddings + token_embeddings
-        )
-        bos_embedding = attended_embeddings[:, 0, :]
-        return self.mlp(bos_embedding)
+        return self.mlp(pooled_sequence_embedding)
 
 
 class SequenceRegressionDataset(torch.utils.data.Dataset):
@@ -261,7 +254,7 @@ class ConvolutionalNetworkModel(TorchModel):
         )
 
 
-class FrozenESMTransformerModel:
+class FrozenESMMeanPooledModel:
     def __init__(self, args, **kwargs):
         self.args = args
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -269,10 +262,8 @@ class FrozenESMTransformerModel:
         model_name = args.esm_model_name
         self.max_length = args.esm_max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.net = ESMTransformerRegressor(
+        self.net = ESMMeanPooledRegressor(
             model_name=model_name,
-            num_attention_heads=args.esm_attention_heads,
-            attention_dropout=args.esm_attention_dropout,
             mlp_hidden_dim=args.esm_mlp_hidden_dim,
             mlp_dropout=args.esm_mlp_dropout,
         ).to(self.device)
@@ -367,5 +358,5 @@ class FrozenESMTransformerModel:
 
 def build_surrogate_model(seq_length, args):
     if args.surrogate_arch == "esm_transformer":
-        return FrozenESMTransformerModel(args)
+        return FrozenESMMeanPooledModel(args)
     return ConvolutionalNetworkModel(seq_length, args)

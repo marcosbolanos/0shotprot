@@ -71,8 +71,6 @@ def get_parser():
         type=str,
         default="facebook/esm2_t6_8M_UR50D",
     )
-    parser.add_argument("--esm_attention_heads", type=int, default=4)
-    parser.add_argument("--esm_attention_dropout", type=float, default=0.1)
     parser.add_argument("--esm_mlp_hidden_dim", type=int, default=256)
     parser.add_argument("--esm_mlp_dropout", type=float, default=0.25)
     parser.add_argument(
