@@ -48,7 +48,7 @@ N_ITERS=10
 MIN_CORR=3
 MAX_CORR=10
 
-if [[ "$SURROGATE_ARCH" != "cnn" && "$SURROGATE_ARCH" != "frozen_esm_mlp"]]; then
+if [[ "$SURROGATE_ARCH" != "cnn" && "$SURROGATE_ARCH" != "frozen_esm_mlp" ]]; then
     echo "Invalid surrogate_arch: $SURROGATE_ARCH"
     echo "Allowed values: cnn, frozen_esm_mlp"
     exit 1
