@@ -104,65 +104,65 @@ def main() -> None:
                     batch_dir.mkdir(parents=True, exist_ok=True)
                     print(f"Running {args.task} seeds for n_samples={n_samples}")
 
-                cmd_template = [
-                    sys.executable,
-                    "src/prospero/runners/run_protein.py",
-                    "--task",
-                    args.task,
-                    "--results_dirpath",
-                    str(batch_dir),
-                    "--n_iters",
-                    str(n_iters),
-                    "--min_corruptions",
-                    str(args.min_corruptions),
-                    "--max_corruptions",
-                    str(args.max_corruptions),
-                    "--surrogate_arch",
-                    args.surrogate_arch,
-                    "--full_deterministic",
-                ]
-                n_queries = args.n_queries_base if args.n_queries_base is not None else n_samples
-                cmd_template.extend(["--n_queries", str(n_queries)])
+                    cmd_template = [
+                        sys.executable,
+                        "src/prospero/runners/run_protein.py",
+                        "--task",
+                        args.task,
+                        "--results_dirpath",
+                        str(batch_dir),
+                        "--n_iters",
+                        str(n_iters),
+                        "--min_corruptions",
+                        str(args.min_corruptions),
+                        "--max_corruptions",
+                        str(args.max_corruptions),
+                        "--surrogate_arch",
+                        args.surrogate_arch,
+                        "--full_deterministic",
+                    ]
+                    n_queries = args.n_queries_base if args.n_queries_base is not None else n_samples
+                    cmd_template.extend(["--n_queries", str(n_queries)])
 
-                env = os.environ.copy()
-                if args.uv_cache_dir:
-                    env["UV_CACHE_DIR"] = args.uv_cache_dir
+                    env = os.environ.copy()
+                    if args.uv_cache_dir:
+                        env["UV_CACHE_DIR"] = args.uv_cache_dir
 
-                seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
+                    seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
 
-                errors: list[tuple[Sequence[str], Exception]] = []
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_cmd = {
-                        executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
-                        for cmd in seed_cmds
-                    }
-                    for future in concurrent.futures.as_completed(future_to_cmd):
-                        cmd = future_to_cmd[future]
-                        try:
-                            future.result()
-                        except Exception as exc:  # include subprocess.CalledProcessError
-                            errors.append((cmd, exc))
-                        finally:
-                            progress.update(1)
+                    errors: list[tuple[Sequence[str], Exception]] = []
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_cmd = {
+                            executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
+                            for cmd in seed_cmds
+                        }
+                        for future in concurrent.futures.as_completed(future_to_cmd):
+                            cmd = future_to_cmd[future]
+                            try:
+                                future.result()
+                            except Exception as exc:  # include subprocess.CalledProcessError
+                                errors.append((cmd, exc))
+                            finally:
+                                progress.update(1)
 
-                if errors:
-                    for cmd, exc in errors:
-                        print("Seed command failed:", " ".join(cmd), file=sys.stderr)
-                        print(exc, file=sys.stderr)
-                    raise SystemExit(1)
+                    if errors:
+                        for cmd, exc in errors:
+                            print("Seed command failed:", " ".join(cmd), file=sys.stderr)
+                            print(exc, file=sys.stderr)
+                        raise SystemExit(1)
 
-                print(f"Completed seeds for n_samples={n_samples}, running ETL")
-                etl_cmd = [
-                    sys.executable,
-                    "src/prospero/runners/etl_results.py",
-                    "--task",
-                    args.task,
-                    "--results_dirpath",
-                    str(batch_dir),
-                    "--n_iters",
-                    str(n_iters),
-                ]
-                _run_command(etl_cmd, env)
+                    print(f"Completed seeds for n_samples={n_samples}, running ETL")
+                    etl_cmd = [
+                        sys.executable,
+                        "src/prospero/runners/etl_results.py",
+                        "--task",
+                        args.task,
+                        "--results_dirpath",
+                        str(batch_dir),
+                        "--n_iters",
+                        str(n_iters),
+                    ]
+                    _run_command(etl_cmd, env)
         finally:
             sys.stdout = original_stdout
             sys.stderr = original_stderr
