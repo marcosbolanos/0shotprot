@@ -6,6 +6,7 @@ import sys
 import logging
 import hashlib
 from pathlib import Path
+from time import sleep
 from sqlalchemy import LargeBinary, String, Integer, create_engine, select, text  # type: ignore[reportMissingImports]
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column  # type: ignore[reportMissingImports]
 from sqlalchemy.exc import OperationalError  # type: ignore[reportMissingImports]
@@ -93,7 +94,10 @@ class ESMEmbeddingCache:
         self.max_length = max_length
         self.embedding_dim = embedding_dim
         self.pooling_name = "mean_pool_residue_embeddings"
-        self.engine = create_engine(f"sqlite:///{self.cache_path}")
+        self.engine = create_engine(
+            f"sqlite:///{self.cache_path}",
+            connect_args={"timeout": 30, "check_same_thread": False},
+        )
         with self.engine.begin() as connection:
             connection.execute(text("PRAGMA journal_mode=WAL"))
         try:
@@ -156,10 +160,20 @@ class ESMEmbeddingCache:
                 )
             )
 
-        with Session(self.engine) as session:
-            for row in rows:
-                session.merge(row)
-            session.commit()
+        attempts = 0
+        max_attempts = 5
+        while True:
+            try:
+                with Session(self.engine) as session:
+                    for row in rows:
+                        session.merge(row)
+                    session.commit()
+                break
+            except OperationalError as exc:
+                attempts += 1
+                if attempts >= max_attempts:
+                    raise
+                sleep(0.25 * attempts)
 
 
 class TorchModel:
