@@ -1328,6 +1328,7 @@ dependencies = [
     { name = "setuptools" },
     { name = "tape-proteins" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -1340,6 +1341,7 @@ requires-dist = [
     { name = "setuptools", specifier = "<82" },
     { name = "tape-proteins" },
     { name = "torch", specifier = ">=2.10.0" },
+    { name = "tqdm", specifier = ">=4.67.3" },
     { name = "transformers", specifier = ">=5.3.0" },
 ]
 

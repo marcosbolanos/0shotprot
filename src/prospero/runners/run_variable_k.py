@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence, TextIO
 
+from tqdm import tqdm
+
 
 class TeeStream:
     """Duplicate writes so console output is mirrored in the log file."""
@@ -90,10 +92,17 @@ def main() -> None:
             max_workers = max(1, args.max_workers)
             n_iters = args.n_iters
 
-            for n_samples in n_samples_values:
-                batch_dir = results_dir / f"n_samples_{n_samples}"
-                batch_dir.mkdir(parents=True, exist_ok=True)
-                print(f"Running {args.task} seeds for n_samples={n_samples}")
+            total_runs = len(n_samples_values) * len(seeds)
+            with tqdm(
+                total=total_runs,
+                desc="variable_k seeds",
+                unit="seed",
+                leave=True,
+            ) as progress:
+                for n_samples in n_samples_values:
+                    batch_dir = results_dir / f"n_samples_{n_samples}"
+                    batch_dir.mkdir(parents=True, exist_ok=True)
+                    print(f"Running {args.task} seeds for n_samples={n_samples}")
 
                 cmd_template = [
                     sys.executable,
@@ -133,6 +142,8 @@ def main() -> None:
                             future.result()
                         except Exception as exc:  # include subprocess.CalledProcessError
                             errors.append((cmd, exc))
+                        finally:
+                            progress.update(1)
 
                 if errors:
                     for cmd, exc in errors:
