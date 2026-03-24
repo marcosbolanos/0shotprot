@@ -8,8 +8,9 @@ import hashlib
 from pathlib import Path
 from time import sleep
 from sqlalchemy import LargeBinary, String, Integer, create_engine, select, text  # type: ignore[reportMissingImports]
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column  # type: ignore[reportMissingImports]
-from sqlalchemy.exc import OperationalError  # type: ignore[reportMissingImports]
+from sqlalchemy.exc import OperationalError, IntegrityError # type: ignore[reportMissingImports]
 from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
 logger = logging.getLogger(__name__)
@@ -219,15 +220,17 @@ class ESMEmbeddingCache:
         while True:
             try:
                 with Session(self.engine) as session:
-                    for row in rows:
-                        session.merge(row)
+                    stmt = insert(ESMEmbeddingCacheRow).values(rows)
+                    stmt = stmt.on_conflict_do_nothing(index_elements=["cache_key"])
+                    session.execute(stmt)
                     session.commit()
                 break
-            except OperationalError as exc:
+            except (OperationalError, IntegrityError) as exc:
                 attempts += 1
                 if attempts >= max_attempts:
                     raise
                 sleep(0.25 * attempts)
+            
 
 
 class TorchModel:
