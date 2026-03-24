@@ -5,7 +5,26 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence, TextIO
+
+
+class TeeStream:
+    """Duplicate writes so console output is mirrored in the log file."""
+
+    def __init__(self, *streams: TextIO) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -15,8 +34,23 @@ def parse_int_list(value: str) -> list[int]:
         raise argparse.ArgumentTypeError(f"invalid integer list: {value}") from error
 
 
+def _run_command(process_args: Sequence[str], env: Optional[dict[str, str]]) -> None:
+    completed = subprocess.run(
+        process_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    completed.check_returncode()
+
+
 def run_seed(process_args: Sequence[str], env: dict[str, str]) -> None:
-    subprocess.run(process_args, check=True, env=env)
+    _run_command(process_args, env)
 
 
 def main() -> None:
@@ -42,73 +76,85 @@ def main() -> None:
 
     results_dir = args.results_dir
     results_dir.mkdir(parents=True, exist_ok=True)
-    n_samples_values = parse_int_list(args.n_samples)
-    seeds = parse_int_list(args.seeds)
-    max_workers = max(1, args.max_workers)
-    n_iters = args.n_iters
+    log_path = results_dir / "run_variable_k.log"
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = TeeStream(original_stdout, log_file)
+        sys.stderr = TeeStream(original_stderr, log_file)
+        try:
+            print(f"Logging console output to {log_path}")
 
-    for n_samples in n_samples_values:
-        batch_dir = results_dir / f"n_samples_{n_samples}"
-        batch_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Running {args.task} seeds for n_samples={n_samples}")
+            n_samples_values = parse_int_list(args.n_samples)
+            seeds = parse_int_list(args.seeds)
+            max_workers = max(1, args.max_workers)
+            n_iters = args.n_iters
 
-        cmd_template = [
-            sys.executable,
-            "src/prospero/runners/run_protein.py",
-            "--task",
-            args.task,
-            "--results_dirpath",
-            str(batch_dir),
-            "--n_iters",
-            str(n_iters),
-            "--min_corruptions",
-            str(args.min_corruptions),
-            "--max_corruptions",
-            str(args.max_corruptions),
-            "--surrogate_arch",
-            args.surrogate_arch,
-            "--full_deterministic",
-        ]
-        n_queries = args.n_queries_base if args.n_queries_base is not None else n_samples
-        cmd_template.extend(["--n_queries", str(n_queries)])
+            for n_samples in n_samples_values:
+                batch_dir = results_dir / f"n_samples_{n_samples}"
+                batch_dir.mkdir(parents=True, exist_ok=True)
+                print(f"Running {args.task} seeds for n_samples={n_samples}")
 
-        env = os.environ.copy()
-        if args.uv_cache_dir:
-            env["UV_CACHE_DIR"] = args.uv_cache_dir
+                cmd_template = [
+                    sys.executable,
+                    "src/prospero/runners/run_protein.py",
+                    "--task",
+                    args.task,
+                    "--results_dirpath",
+                    str(batch_dir),
+                    "--n_iters",
+                    str(n_iters),
+                    "--min_corruptions",
+                    str(args.min_corruptions),
+                    "--max_corruptions",
+                    str(args.max_corruptions),
+                    "--surrogate_arch",
+                    args.surrogate_arch,
+                    "--full_deterministic",
+                ]
+                n_queries = args.n_queries_base if args.n_queries_base is not None else n_samples
+                cmd_template.extend(["--n_queries", str(n_queries)])
 
-        seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
+                env = os.environ.copy()
+                if args.uv_cache_dir:
+                    env["UV_CACHE_DIR"] = args.uv_cache_dir
 
-        errors: list[tuple[Sequence[str], Exception]] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_cmd = {
-                executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
-                for cmd in seed_cmds
-            }
-            for future in concurrent.futures.as_completed(future_to_cmd):
-                cmd = future_to_cmd[future]
-                try:
-                    future.result()
-                except Exception as exc:  # include subprocess.CalledProcessError
-                    errors.append((cmd, exc))
+                seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
 
-        if errors:
-            for cmd, exc in errors:
-                print(f"Seed command failed: {' '.join(cmd)}", file=sys.stderr)
-                print(exc, file=sys.stderr)
-            raise SystemExit(1)
+                errors: list[tuple[Sequence[str], Exception]] = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    future_to_cmd = {
+                        executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
+                        for cmd in seed_cmds
+                    }
+                    for future in concurrent.futures.as_completed(future_to_cmd):
+                        cmd = future_to_cmd[future]
+                        try:
+                            future.result()
+                        except Exception as exc:  # include subprocess.CalledProcessError
+                            errors.append((cmd, exc))
 
-        print(f"Completed seeds for n_samples={n_samples}, running ETL")
-        etl_cmd = [
-            sys.executable,
-            "src/prospero/runners/etl_results.py",
-            "--task",
-            args.task,
-            "--results_dirpath",
-            str(batch_dir),
-            "--n_iters",
-            str(n_iters),
-        ]
-        subprocess.run(etl_cmd, check=True)
+                if errors:
+                    for cmd, exc in errors:
+                        print("Seed command failed:", " ".join(cmd), file=sys.stderr)
+                        print(exc, file=sys.stderr)
+                    raise SystemExit(1)
+
+                print(f"Completed seeds for n_samples={n_samples}, running ETL")
+                etl_cmd = [
+                    sys.executable,
+                    "src/prospero/runners/etl_results.py",
+                    "--task",
+                    args.task,
+                    "--results_dirpath",
+                    str(batch_dir),
+                    "--n_iters",
+                    str(n_iters),
+                ]
+                _run_command(etl_cmd, env)
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 
 if __name__ == "__main__":
