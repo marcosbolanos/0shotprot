@@ -93,6 +93,27 @@ def build_model(monkeypatch, tmp_path, **arg_overrides):
     return model, fake_esm
 
 
+def build_per_residue_model(monkeypatch, tmp_path, seq_length=5, **arg_overrides):
+    fake_esm = FakeESM()
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm.sqlite3"
+    )
+    monkeypatch.setattr(
+        surrogate.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        surrogate.AutoModel,
+        "from_pretrained",
+        lambda model_name: fake_esm,
+    )
+    model = surrogate.FrozenESMPerResidueCNNModel(
+        seq_length, make_args(**arg_overrides)
+    )
+    return model, fake_esm
+
+
 def test_cached_embeddings_are_reused(monkeypatch, tmp_path):
     model, fake_esm = build_model(monkeypatch, tmp_path)
 
@@ -128,3 +149,58 @@ def test_training_uses_cached_embeddings_across_retrains(monkeypatch, tmp_path):
 
     model.train(dataset)
     assert fake_esm.forward_call_count == 2
+
+
+def test_cached_per_residue_embeddings_are_reused(monkeypatch, tmp_path):
+    model, fake_esm = build_per_residue_model(monkeypatch, tmp_path, seq_length=5)
+
+    sequences = ["ACDEF", "AAAAC", "ACDEF"]
+    first_embeddings = model.get_residue_sequence_embeddings(sequences)
+    assert fake_esm.forward_call_count == 1
+
+    second_embeddings = model.get_residue_sequence_embeddings(sequences)
+    assert fake_esm.forward_call_count == 1
+
+    predictions = model.get_fitness(["AAAAC", "CCCCC"])
+    assert fake_esm.forward_call_count == 2
+
+    assert first_embeddings.shape == (3, 5, fake_esm.config.hidden_size)
+    assert torch.allclose(first_embeddings, second_embeddings)
+    assert torch.allclose(first_embeddings[0], first_embeddings[2])
+    assert predictions.shape == (2,)
+    assert (tmp_path / "esm.sqlite3").exists()
+
+
+def test_per_residue_training_uses_cached_embeddings_across_retrains(
+    monkeypatch, tmp_path
+):
+    model, fake_esm = build_per_residue_model(monkeypatch, tmp_path, seq_length=5)
+
+    dataset = SimpleNamespace(
+        train=np.array(["ACDEF", "AAAAC", "ACDEF"], dtype=object),
+        train_scores=np.array([1.0, 2.0, 1.5], dtype=np.float32),
+        valid=np.array(["CCCCC"], dtype=object),
+        valid_scores=np.array([0.5], dtype=np.float32),
+    )
+
+    model.train(dataset)
+    assert fake_esm.forward_call_count == 2
+
+    model.train(dataset)
+    assert fake_esm.forward_call_count == 2
+
+
+def test_build_surrogate_model_supports_frozen_esm_cnn(monkeypatch, tmp_path):
+    fake_esm = FakeESM(hidden_size=10)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm.sqlite3"
+    )
+
+    model = surrogate.build_surrogate_model(
+        5,
+        make_args(surrogate_arch="frozen_esm_cnn"),
+        shared_esm_components=(FakeTokenizer(), fake_esm),
+    )
+
+    assert isinstance(model, surrogate.FrozenESMPerResidueCNNModel)
+    assert model.net.conv_1.in_channels == fake_esm.config.hidden_size

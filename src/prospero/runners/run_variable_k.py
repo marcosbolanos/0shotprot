@@ -1,4 +1,5 @@
 """Run the variable-n_queries experiments from Python instead of bash."""
+
 import argparse
 import concurrent.futures
 import os
@@ -26,7 +27,9 @@ class TeeStream:
             stream.flush()
 
     def isatty(self) -> bool:
-        return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
+        return any(
+            getattr(stream, "isatty", lambda: False)() for stream in self._streams
+        )
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -62,7 +65,9 @@ def main() -> None:
     parser.add_argument("results_dir", type=Path)
     parser.add_argument("--task", default="AAV")
     parser.add_argument(
-        "--surrogate-arch", default="cnn", choices=("cnn", "frozen_esm_mlp")
+        "--surrogate-arch",
+        default="cnn",
+        choices=("cnn", "frozen_esm_mlp", "frozen_esm_cnn"),
     )
     parser.add_argument("--n-samples", default="8,16,32,64,128")
     parser.add_argument("--seeds", default="1,2,3,4,5")
@@ -71,9 +76,7 @@ def main() -> None:
     parser.add_argument("--max-corruptions", type=int, default=10)
     parser.add_argument("--max-workers", type=int, default=5)
     parser.add_argument("--n-queries-base", type=int, default=None)
-    parser.add_argument(
-        "--uv-cache-dir", default=os.environ.get("UV_CACHE_DIR")
-    )
+    parser.add_argument("--uv-cache-dir", default=os.environ.get("UV_CACHE_DIR"))
     args = parser.parse_args()
 
     results_dir = args.results_dir
@@ -121,7 +124,11 @@ def main() -> None:
                         args.surrogate_arch,
                         "--full_deterministic",
                     ]
-                    n_queries = args.n_queries_base if args.n_queries_base is not None else n_samples
+                    n_queries = (
+                        args.n_queries_base
+                        if args.n_queries_base is not None
+                        else n_samples
+                    )
                     cmd_template.extend(["--n_queries", str(n_queries)])
 
                     env = os.environ.copy()
@@ -131,7 +138,9 @@ def main() -> None:
                     seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
 
                     errors: list[tuple[Sequence[str], Exception]] = []
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max_workers
+                    ) as executor:
                         future_to_cmd = {
                             executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
                             for cmd in seed_cmds
@@ -140,14 +149,18 @@ def main() -> None:
                             cmd = future_to_cmd[future]
                             try:
                                 future.result()
-                            except Exception as exc:  # include subprocess.CalledProcessError
+                            except (
+                                Exception
+                            ) as exc:  # include subprocess.CalledProcessError
                                 errors.append((cmd, exc))
                             finally:
                                 progress.update(1)
 
                     if errors:
                         for cmd, exc in errors:
-                            print("Seed command failed:", " ".join(cmd), file=sys.stderr)
+                            print(
+                                "Seed command failed:", " ".join(cmd), file=sys.stderr
+                            )
                             print(exc, file=sys.stderr)
                         raise SystemExit(1)
 

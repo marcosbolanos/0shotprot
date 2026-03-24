@@ -32,6 +32,9 @@ logging.basicConfig(
 )
 
 
+FROZEN_ESM_SURROGATE_ARCHS = {"frozen_esm_mlp", "frozen_esm_cnn"}
+
+
 def get_parser():
     parser = argparse.ArgumentParser(
         description="Unified Argument Parser for Oracle, Dataset, and Proxy Arguments",
@@ -67,7 +70,7 @@ def get_parser():
     parser.add_argument(
         "--surrogate_arch",
         type=str,
-        choices=["cnn", "frozen_esm_mlp"],
+        choices=["cnn", "frozen_esm_mlp", "frozen_esm_cnn"],
         default="cnn",
     )
     parser.add_argument(
@@ -102,7 +105,7 @@ def run_iter(args, logger):
     dataset = RegressionDataset(args.task)
 
     shared_esm_components = None
-    if args.surrogate_arch in {"frozen_esm_mlp"}:
+    if args.surrogate_arch in FROZEN_ESM_SURROGATE_ARCHS:
         shared_esm_components = prepare_shared_esm_components(args)
 
     proxy = Ensemble(
@@ -174,7 +177,11 @@ def run_iter(args, logger):
 
         proxy = Ensemble(
             [
-                build_surrogate_model(len(wt_sequence), args)
+                build_surrogate_model(
+                    len(wt_sequence),
+                    args,
+                    shared_esm_components=shared_esm_components,
+                )
                 for _ in range(args.ensemble_size)
             ]
         )
