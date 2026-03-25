@@ -63,6 +63,9 @@ def make_args(**overrides):
         "esm_max_length": None,
         "esm_mlp_hidden_dim": 4,
         "esm_mlp_dropout": 0.0,
+        "esm_cnn_projection_dim": None,
+        "esm_cnn_use_layernorm": False,
+        "esm_cnn_concat_one_hot": False,
         "lr": 1e-3,
         "weight_decay": 0.0,
         "proxy_batch_size": 2,
@@ -77,7 +80,7 @@ def make_args(**overrides):
 def build_model(monkeypatch, tmp_path, **arg_overrides):
     fake_esm = FakeESM()
     monkeypatch.setattr(
-        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm.sqlite3"
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
     )
     monkeypatch.setattr(
         surrogate.AutoTokenizer,
@@ -96,7 +99,7 @@ def build_model(monkeypatch, tmp_path, **arg_overrides):
 def build_per_residue_model(monkeypatch, tmp_path, seq_length=5, **arg_overrides):
     fake_esm = FakeESM()
     monkeypatch.setattr(
-        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm.sqlite3"
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
     )
     monkeypatch.setattr(
         surrogate.AutoTokenizer,
@@ -131,7 +134,7 @@ def test_cached_embeddings_are_reused(monkeypatch, tmp_path):
     assert torch.allclose(first_embeddings, second_embeddings)
     assert torch.allclose(first_embeddings[0], first_embeddings[2])
     assert predictions.shape == (2,)
-    assert (tmp_path / "esm.sqlite3").exists()
+    assert list((tmp_path / "esm_embeddings").rglob("*.pt"))
 
 
 def test_training_uses_cached_embeddings_across_retrains(monkeypatch, tmp_path):
@@ -168,7 +171,7 @@ def test_cached_per_residue_embeddings_are_reused(monkeypatch, tmp_path):
     assert torch.allclose(first_embeddings, second_embeddings)
     assert torch.allclose(first_embeddings[0], first_embeddings[2])
     assert predictions.shape == (2,)
-    assert (tmp_path / "esm.sqlite3").exists()
+    assert list((tmp_path / "esm_embeddings").rglob("*.pt"))
 
 
 def test_per_residue_training_uses_cached_embeddings_across_retrains(
@@ -193,7 +196,7 @@ def test_per_residue_training_uses_cached_embeddings_across_retrains(
 def test_build_surrogate_model_supports_frozen_esm_cnn(monkeypatch, tmp_path):
     fake_esm = FakeESM(hidden_size=10)
     monkeypatch.setattr(
-        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm.sqlite3"
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
     )
 
     model = surrogate.build_surrogate_model(
@@ -204,3 +207,36 @@ def test_build_surrogate_model_supports_frozen_esm_cnn(monkeypatch, tmp_path):
 
     assert isinstance(model, surrogate.FrozenESMPerResidueCNNModel)
     assert model.net.conv_1.in_channels == fake_esm.config.hidden_size
+
+
+def test_frozen_esm_cnn_projection_changes_input_channels(monkeypatch, tmp_path):
+    fake_esm = FakeESM(hidden_size=10)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+
+    model = surrogate.build_surrogate_model(
+        5,
+        make_args(surrogate_arch="frozen_esm_cnn", esm_cnn_projection_dim=6),
+        shared_esm_components=(FakeTokenizer(), fake_esm),
+    )
+
+    assert isinstance(model.input_adapter.projection, nn.Linear)
+    assert model.net.conv_1.in_channels == 6
+
+
+def test_frozen_esm_cnn_can_concatenate_one_hot_inputs(monkeypatch, tmp_path):
+    model, fake_esm = build_per_residue_model(
+        monkeypatch,
+        tmp_path,
+        seq_length=5,
+        esm_cnn_projection_dim=6,
+        esm_cnn_use_layernorm=True,
+        esm_cnn_concat_one_hot=True,
+    )
+
+    predictions = model.get_fitness(["ACDEF", "AAAAC"])
+
+    assert fake_esm.forward_call_count == 1
+    assert model.net.conv_1.in_channels == 26
+    assert predictions.shape == (2,)

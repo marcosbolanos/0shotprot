@@ -103,7 +103,7 @@ def extract_residue_embeddings(
 def get_esm_embedding_cache_path():
     cache_dir = Path(__file__).resolve().parents[2] / ".cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / "esm_embeddings.sqlite3"
+    return cache_dir / "esm_embeddings"
 
 class TorchModel:
     def __init__(self, args, alphabet, net, **kwargs):
@@ -175,6 +175,23 @@ class TorchModel:
         return predictions
 
 
+class SequenceRepresentationDataset(torch.utils.data.Dataset):
+    def __init__(self, sequence_representations, labels, sequences):
+        self.sequence_representations = sequence_representations
+        self.labels = labels
+        self.sequences = sequences
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, index):
+        return (
+            self.sequence_representations[index],
+            self.labels[index],
+            self.sequences[index],
+        )
+
+
 class CNN(nn.Module):
     """
     The CNN architecture is adopted from the following paper with slight modification:
@@ -217,6 +234,36 @@ class CNN(nn.Module):
         x = self.dropout_1(x)
         x = self.dense_3(x)
         return x
+
+
+class ESMCNNInputAdapter(nn.Module):
+    def __init__(
+        self,
+        embedding_dim,
+        output_dim=None,
+        use_layernorm=False,
+        concat_one_hot=False,
+        one_hot_dim=20,
+    ):
+        super().__init__()
+        self.concat_one_hot = concat_one_hot
+        self.one_hot_dim = one_hot_dim
+        self.layernorm = nn.LayerNorm(embedding_dim) if use_layernorm else nn.Identity()
+        if output_dim is None:
+            self.projection = nn.Identity()
+            self.output_dim = embedding_dim
+        else:
+            self.projection = nn.Linear(embedding_dim, output_dim)
+            self.output_dim = output_dim
+
+    def forward(self, sequence_representations, one_hots=None):
+        x = self.layernorm(sequence_representations)
+        x = self.projection(x)
+        if self.concat_one_hot:
+            if one_hots is None:
+                raise ValueError("One-hot inputs are required when concat_one_hot=True.")
+            x = torch.cat([x, one_hots], dim=-1)
+        return torch.permute(x, [0, 2, 1]).contiguous()
 
 
 class ESMMeanPooledRegressor(nn.Module):
@@ -302,6 +349,7 @@ class FrozenESMModel:
             model_name=model_name,
             max_length=self.max_length,
             representation_name=representation_name,
+            cache_root=get_esm_embedding_cache_path(),
         )
         self.net = build_net(embedding_dim).to(self.device)
         trainable_parameters = [
@@ -360,14 +408,20 @@ class FrozenESMModel:
         ]
         return torch.stack(ordered_embeddings, dim=0)
 
-    def _prepare_net_inputs(self, sequence_representations):
+    def _prepare_net_inputs(self, sequence_representations, sequences=None):
         return sequence_representations
 
     def compute_loss(self, data):
-        sequence_representations, labels = data
+        if len(data) == 3:
+            sequence_representations, labels, sequences = data
+        else:
+            sequence_representations, labels = data
+            sequences = None
         outputs = torch.squeeze(
             self.net(
-                self._prepare_net_inputs(sequence_representations).to(self.device)
+                self._prepare_net_inputs(
+                    sequence_representations, sequences=sequences
+                ).to(self.device)
             ),
             dim=-1,
         )
@@ -418,7 +472,9 @@ class FrozenESMModel:
                 normalized_sequences
             )
             predictions = self.net(
-                self._prepare_net_inputs(sequence_representations).to(self.device),
+                self._prepare_net_inputs(
+                    sequence_representations, sequences=normalized_sequences
+                ).to(self.device),
             ).squeeze()
         return predictions
 
@@ -466,16 +522,28 @@ class FrozenESMMeanPooledModel(FrozenESMModel):
 class FrozenESMPerResidueCNNModel(FrozenESMModel):
     def __init__(self, seq_length, args, tokenizer=None, esm=None, **kwargs):
         self.seq_length = seq_length
+        self.alphabet = "ACDEFGHIKLMNPQRSTVWY"
+        projection_dim = args.esm_cnn_projection_dim
+        concat_one_hot = args.esm_cnn_concat_one_hot
         super().__init__(
             args,
             build_net=lambda embedding_dim: CNN(
-                num_input_channels=embedding_dim,
+                num_input_channels=(
+                    (projection_dim or embedding_dim)
+                    + (20 if concat_one_hot else 0)
+                ),
                 seq_length=seq_length,
             ),
             representation_name="per_residue_embeddings_v1",
             tokenizer=tokenizer,
             esm=esm,
             **kwargs,
+        )
+        self.input_adapter = ESMCNNInputAdapter(
+            embedding_dim=self.embedding_dim,
+            output_dim=projection_dim,
+            use_layernorm=args.esm_cnn_use_layernorm,
+            concat_one_hot=concat_one_hot,
         )
 
     def _compute_sequence_representations(self, sequences):
@@ -504,8 +572,36 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
 
         return torch.cat(residue_sequence_embeddings, dim=0)
 
-    def _prepare_net_inputs(self, sequence_representations):
-        return torch.permute(sequence_representations, [0, 2, 1]).contiguous()
+    def _prepare_net_inputs(self, sequence_representations, sequences=None):
+        one_hots = None
+        if self.args.esm_cnn_concat_one_hot:
+            if sequences is None:
+                raise ValueError(
+                    "Sequences are required when esm_cnn_concat_one_hot=True."
+                )
+            one_hots = torch.permute(
+                sequences_to_tensor(sequences, self.alphabet),
+                [0, 2, 1],
+            ).contiguous()
+        return self.input_adapter(sequence_representations, one_hots=one_hots)
+
+    def get_data_loader(self, sequences, labels, shuffle):
+        normalized_sequences = normalize_sequences(sequences)
+        sequence_representations = self.get_sequence_representations(
+            normalized_sequences
+        )
+        labels = torch.from_numpy(labels).float()
+        dataset = SequenceRepresentationDataset(
+            sequence_representations, labels, normalized_sequences
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset=dataset, batch_size=self.args.proxy_batch_size, shuffle=shuffle
+        )
+        return loader
+
+    def compute_loss(self, data):
+        sequence_representations, labels, sequences = data
+        return super().compute_loss((sequence_representations, labels, sequences))
 
     def get_residue_sequence_embeddings(self, sequences):
         return self.get_sequence_representations(sequences)

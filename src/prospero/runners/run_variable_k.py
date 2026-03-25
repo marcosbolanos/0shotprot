@@ -69,6 +69,9 @@ def main() -> None:
         default="cnn",
         choices=("cnn", "frozen_esm_mlp", "frozen_esm_cnn"),
     )
+    parser.add_argument("--esm-cnn-projection-dim", type=int, default=None)
+    parser.add_argument("--esm-cnn-use-layernorm", action="store_true", default=False)
+    parser.add_argument("--esm-cnn-concat-one-hot", action="store_true", default=False)
     parser.add_argument("--n-samples", default="8,16,32,64,128")
     parser.add_argument("--seeds", default="1,2,3,4,5")
     parser.add_argument("--n-iters", type=int, default=10)
@@ -124,6 +127,17 @@ def main() -> None:
                         args.surrogate_arch,
                         "--full_deterministic",
                     ]
+                    if args.esm_cnn_projection_dim is not None:
+                        cmd_template.extend(
+                            [
+                                "--esm_cnn_projection_dim",
+                                str(args.esm_cnn_projection_dim),
+                            ]
+                        )
+                    if args.esm_cnn_use_layernorm:
+                        cmd_template.append("--esm_cnn_use_layernorm")
+                    if args.esm_cnn_concat_one_hot:
+                        cmd_template.append("--esm_cnn_concat_one_hot")
                     n_queries = (
                         args.n_queries_base
                         if args.n_queries_base is not None

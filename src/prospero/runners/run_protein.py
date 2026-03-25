@@ -80,6 +80,9 @@ def get_parser():
     )
     parser.add_argument("--esm_mlp_hidden_dim", type=int, default=256)
     parser.add_argument("--esm_mlp_dropout", type=float, default=0.25)
+    parser.add_argument("--esm_cnn_projection_dim", type=int, default=None)
+    parser.add_argument("--esm_cnn_use_layernorm", action="store_true", default=False)
+    parser.add_argument("--esm_cnn_concat_one_hot", action="store_true", default=False)
     parser.add_argument(
         "--esm_max_length",
         type=int,
