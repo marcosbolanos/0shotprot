@@ -13,6 +13,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column  # ty
 from sqlalchemy.exc import OperationalError, IntegrityError # type: ignore[reportMissingImports]
 from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
+from .esm.cache import ESMEmbeddingFileCache
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -426,10 +428,9 @@ class FrozenESMModel:
 
         embedding_dim = self.esm.config.hidden_size
         self.embedding_dim = embedding_dim
-        self.embedding_cache = ESMEmbeddingCache(
+        self.embedding_cache = ESMEmbeddingFileCache(
             model_name=model_name,
             max_length=self.max_length,
-            embedding_dim=embedding_dim,
             representation_name=representation_name,
         )
         self.net = build_net(embedding_dim).to(self.device)
