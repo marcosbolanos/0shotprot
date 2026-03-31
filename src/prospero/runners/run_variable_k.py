@@ -5,10 +5,19 @@ import concurrent.futures
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional, Sequence, TextIO
 
 from tqdm import tqdm
+
+from prospero.runners.run_protein import (
+    FROZEN_ESM_SURROGATE_ARCHS,
+    get_parser as get_protein_parser,
+    logger as protein_logger,
+    run_iter as run_protein_iter,
+)
+from prospero.surrogate import prepare_shared_esm_components
 
 
 class TeeStream:
@@ -40,22 +49,59 @@ def parse_int_list(value: str) -> list[int]:
 
 
 def _run_command(process_args: Sequence[str], env: Optional[dict[str, str]]) -> None:
-    completed = subprocess.run(
+    run_env = dict(env) if env is not None else os.environ.copy()
+    # Encourage child Python processes to flush output promptly.
+    run_env.setdefault("PYTHONUNBUFFERED", "1")
+
+    with subprocess.Popen(
         process_args,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
+        stderr=subprocess.STDOUT,
+        env=run_env,
         text=True,
-    )
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="", file=sys.stderr)
-    completed.check_returncode()
+        bufsize=1,
+    ) as process:
+        if process.stdout is not None:
+            for line in process.stdout:
+                print(line, end="")
+        return_code = process.wait()
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, process_args)
 
 
 def run_seed(process_args: Sequence[str], env: dict[str, str]) -> None:
     _run_command(process_args, env)
+
+
+def _build_protein_args(
+    runner_args: argparse.Namespace,
+    batch_dir: Path,
+    n_iters: int,
+    n_queries: int,
+    seed: int,
+) -> argparse.Namespace:
+    protein_args = get_protein_parser().parse_args([])
+    protein_args.task = runner_args.task
+    protein_args.results_dirpath = str(batch_dir)
+    protein_args.n_iters = n_iters
+    protein_args.min_corruptions = runner_args.min_corruptions
+    protein_args.max_corruptions = runner_args.max_corruptions
+    protein_args.surrogate_arch = runner_args.surrogate_arch
+    protein_args.full_deterministic = True
+    protein_args.n_queries = n_queries
+    protein_args.seed = seed
+    protein_args.esm_cnn_projection_dim = runner_args.esm_cnn_projection_dim
+    protein_args.esm_cnn_use_layernorm = runner_args.esm_cnn_use_layernorm
+    protein_args.esm_cnn_concat_one_hot = runner_args.esm_cnn_concat_one_hot
+    return protein_args
+
+
+def _run_seed_in_process(
+    protein_args: argparse.Namespace,
+    shared_esm_components,
+) -> None:
+    run_protein_iter(protein_args, protein_logger, shared_esm_components)
 
 
 def main() -> None:
@@ -149,16 +195,37 @@ def main() -> None:
                     if args.uv_cache_dir:
                         env["UV_CACHE_DIR"] = args.uv_cache_dir
 
-                    seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
-
                     errors: list[tuple[Sequence[str], Exception]] = []
+                    seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
                     with concurrent.futures.ThreadPoolExecutor(
                         max_workers=max_workers
                     ) as executor:
-                        future_to_cmd = {
-                            executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
-                            for cmd in seed_cmds
-                        }
+                        future_to_cmd = {}
+                        if args.surrogate_arch in FROZEN_ESM_SURROGATE_ARCHS:
+                            if args.uv_cache_dir:
+                                os.environ["UV_CACHE_DIR"] = args.uv_cache_dir
+                            shared_esm_components = prepare_shared_esm_components(args)
+                            for seed in seeds:
+                                protein_args = _build_protein_args(
+                                    runner_args=args,
+                                    batch_dir=batch_dir,
+                                    n_iters=n_iters,
+                                    n_queries=n_queries,
+                                    seed=seed,
+                                )
+                                future = executor.submit(
+                                    _run_seed_in_process,
+                                    deepcopy(protein_args),
+                                    shared_esm_components,
+                                )
+                                future_to_cmd[future] = (
+                                    f"in-process run_protein seed={seed}",
+                                )
+                        else:
+                            future_to_cmd = {
+                                executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
+                                for cmd in seed_cmds
+                            }
                         for future in concurrent.futures.as_completed(future_to_cmd):
                             cmd = future_to_cmd[future]
                             try:

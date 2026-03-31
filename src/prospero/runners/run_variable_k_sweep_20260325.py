@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--n-iters", type=int, default=10)
     parser.add_argument("--min-corruptions", type=int, default=3)
     parser.add_argument("--max-corruptions", type=int, default=10)
-    parser.add_argument("--max-workers", type=int, default=1)
+    parser.add_argument("--max-workers", type=int, default=5)
     parser.add_argument("--n-queries-base", type=int, default=None)
     parser.add_argument("--uv-cache-dir", default=None)
     args = parser.parse_args()

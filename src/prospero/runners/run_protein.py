@@ -11,6 +11,7 @@ from prospero.inference import ProteinSampler
 from prospero.surrogate import (
     Ensemble,
     build_surrogate_model,
+    normalize_sequences,
     prepare_shared_esm_components,
 )
 from prospero.dataset import RegressionDataset
@@ -93,7 +94,7 @@ def get_parser():
     return parser
 
 
-def run_iter(args, logger):
+def run_iter(args, logger, shared_esm_components=None):
     seed = args.seed
     set_seed(seed, args.full_deterministic)
     logger.info(f"Starting seed {seed}")
@@ -106,9 +107,15 @@ def run_iter(args, logger):
     wt_sequence = WT_SEQUENCES[args.task]
     oracle = get_landscape(args.task)
     dataset = RegressionDataset(args.task)
+    initial_dataset_sequences = set(
+        normalize_sequences(list(dataset.train) + list(dataset.valid))
+    )
+    args.cache_allowed_sequences = initial_dataset_sequences
 
-    shared_esm_components = None
-    if args.surrogate_arch in FROZEN_ESM_SURROGATE_ARCHS:
+    if (
+        shared_esm_components is None
+        and args.surrogate_arch in FROZEN_ESM_SURROGATE_ARCHS
+    ):
         shared_esm_components = prepare_shared_esm_components(args)
 
     proxy = Ensemble(

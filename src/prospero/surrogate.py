@@ -5,6 +5,8 @@ import numpy as np
 import sys
 import logging
 import hashlib
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
 from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
@@ -192,6 +194,18 @@ class SequenceRepresentationDataset(torch.utils.data.Dataset):
         )
 
 
+class SequenceLabelDataset(torch.utils.data.Dataset):
+    def __init__(self, sequences, labels):
+        self.sequences = sequences
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, index):
+        return self.sequences[index], self.labels[index]
+
+
 class CNN(nn.Module):
     """
     The CNN architecture is adopted from the following paper with slight modification:
@@ -330,6 +344,7 @@ class FrozenESMModel:
         representation_name,
         tokenizer=None,
         esm=None,
+        cache_allowed_sequences=None,
         **kwargs,
     ):
         self.args = args
@@ -337,6 +352,7 @@ class FrozenESMModel:
 
         model_name = args.esm_model_name
         self.max_length = args.esm_max_length
+        self.esm_forward_lock = getattr(args, "esm_forward_lock", None)
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
         self.esm = (esm or AutoModel.from_pretrained(model_name)).to(self.device)
         self.esm.eval()
@@ -350,6 +366,11 @@ class FrozenESMModel:
             max_length=self.max_length,
             representation_name=representation_name,
             cache_root=get_esm_embedding_cache_path(),
+        )
+        # Full-cache mode is intentionally disabled to avoid unbounded cache growth.
+        # If no whitelist is provided, no sequence is cacheable.
+        self.cache_allowed_sequences = (
+            set(cache_allowed_sequences) if cache_allowed_sequences is not None else set()
         )
         self.net = build_net(embedding_dim).to(self.device)
         trainable_parameters = [
@@ -386,21 +407,64 @@ class FrozenESMModel:
     def _compute_sequence_representations(self, sequences):
         raise NotImplementedError
 
+    def _esm_forward(self, input_ids, attention_mask):
+        if self.esm_forward_lock is None:
+            return self.esm(
+                input_ids=input_ids.to(self.device),
+                attention_mask=attention_mask.to(self.device),
+            ).last_hidden_state
+
+        # Keep one shared frozen ESM resident on GPU and serialize only its forward
+        # pass so concurrent seed threads do not duplicate weights or thrash VRAM.
+        with self.esm_forward_lock:
+            return self.esm(
+                input_ids=input_ids.to(self.device),
+                attention_mask=attention_mask.to(self.device),
+            ).last_hidden_state
+
     def get_sequence_representations(self, sequences):
         if not sequences:
             return self._compute_sequence_representations(sequences)
 
         unique_sequences = list(dict.fromkeys(sequences))
-        embeddings_by_sequence, missing_sequences = self.embedding_cache.get_many(
-            unique_sequences
-        )
+        cacheable_sequences = [
+            sequence
+            for sequence in unique_sequences
+            if sequence in self.cache_allowed_sequences
+        ]
+        non_cacheable_sequences = [
+            sequence
+            for sequence in unique_sequences
+            if sequence not in self.cache_allowed_sequences
+        ]
 
-        if missing_sequences:
+        embeddings_by_sequence = {}
+        missing_cacheable_sequences = []
+        if cacheable_sequences:
+            (
+                embeddings_by_sequence,
+                missing_cacheable_sequences,
+            ) = self.embedding_cache.get_many(cacheable_sequences)
+
+        if missing_cacheable_sequences:
             missing_embeddings = self._compute_sequence_representations(
-                missing_sequences
+                missing_cacheable_sequences
             )
-            self.embedding_cache.set_many(missing_sequences, missing_embeddings)
-            for sequence, embedding in zip(missing_sequences, missing_embeddings):
+            self.embedding_cache.set_many(
+                missing_cacheable_sequences, missing_embeddings
+            )
+            for sequence, embedding in zip(
+                missing_cacheable_sequences, missing_embeddings
+            ):
+                embeddings_by_sequence[sequence] = embedding
+
+        if non_cacheable_sequences:
+            non_cacheable_embeddings = self._compute_sequence_representations(
+                non_cacheable_sequences
+            )
+            for sequence, embedding in zip(
+                non_cacheable_sequences, non_cacheable_embeddings
+            ):
                 embeddings_by_sequence[sequence] = embedding
 
         ordered_embeddings = [
@@ -504,10 +568,7 @@ class FrozenESMMeanPooledModel(FrozenESMModel):
             batch_sequences = sequences[start : start + batch_size]
             input_ids, attention_mask = self._tokenize_batch(batch_sequences)
             with torch.no_grad():
-                sequence_embeddings = self.esm(
-                    input_ids=input_ids.to(self.device),
-                    attention_mask=attention_mask.to(self.device),
-                ).last_hidden_state
+                sequence_embeddings = self._esm_forward(input_ids, attention_mask)
                 batch_embeddings = mean_pool_residue_embeddings(
                     sequence_embeddings, attention_mask.to(self.device)
                 )
@@ -559,10 +620,7 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
             input_ids, attention_mask = self._tokenize_batch(batch_sequences)
             attention_mask = attention_mask.to(self.device)
             with torch.no_grad():
-                sequence_embeddings = self.esm(
-                    input_ids=input_ids.to(self.device),
-                    attention_mask=attention_mask,
-                ).last_hidden_state
+                sequence_embeddings = self._esm_forward(input_ids, attention_mask)
                 batch_embeddings = extract_residue_embeddings(
                     sequence_embeddings,
                     attention_mask,
@@ -587,20 +645,16 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
 
     def get_data_loader(self, sequences, labels, shuffle):
         normalized_sequences = normalize_sequences(sequences)
-        sequence_representations = self.get_sequence_representations(
-            normalized_sequences
-        )
         labels = torch.from_numpy(labels).float()
-        dataset = SequenceRepresentationDataset(
-            sequence_representations, labels, normalized_sequences
-        )
+        dataset = SequenceLabelDataset(normalized_sequences, labels)
         loader = torch.utils.data.DataLoader(
             dataset=dataset, batch_size=self.args.proxy_batch_size, shuffle=shuffle
         )
         return loader
 
     def compute_loss(self, data):
-        sequence_representations, labels, sequences = data
+        sequences, labels = data
+        sequence_representations = self.get_sequence_representations(sequences)
         return super().compute_loss((sequence_representations, labels, sequences))
 
     def get_residue_sequence_embeddings(self, sequences):
@@ -611,17 +665,34 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
     if args.surrogate_arch in {"frozen_esm_mlp", "frozen_esm_cnn"}:
         tokenizer = None
         esm = None
+        esm_forward_lock = None
         if shared_esm_components is not None:
-            tokenizer, esm = shared_esm_components
+            tokenizer = shared_esm_components.tokenizer
+            esm = shared_esm_components.esm
+            esm_forward_lock = shared_esm_components.esm_forward_lock
+        args.esm_forward_lock = esm_forward_lock
         if args.surrogate_arch == "frozen_esm_mlp":
-            return FrozenESMMeanPooledModel(args, tokenizer=tokenizer, esm=esm)
+            return FrozenESMMeanPooledModel(
+                args,
+                tokenizer=tokenizer,
+                esm=esm,
+                cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
+            )
         return FrozenESMPerResidueCNNModel(
             seq_length,
             args,
             tokenizer=tokenizer,
             esm=esm,
+            cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
         )
     return ConvolutionalNetworkModel(seq_length, args)
+
+
+@dataclass(frozen=True)
+class SharedESMComponents:
+    tokenizer: object
+    esm: object
+    esm_forward_lock: threading.Lock
 
 
 def prepare_shared_esm_components(args):
@@ -631,4 +702,8 @@ def prepare_shared_esm_components(args):
     esm.eval()
     for param in esm.parameters():
         param.requires_grad = False
-    return tokenizer, esm
+    return SharedESMComponents(
+        tokenizer=tokenizer,
+        esm=esm,
+        esm_forward_lock=threading.Lock(),
+    )
