@@ -6,10 +6,10 @@ import sys
 import logging
 import hashlib
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
-from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
 from .esm.cache import ESMEmbeddingFileCache
 
@@ -353,6 +353,8 @@ class FrozenESMModel:
         model_name = args.esm_model_name
         self.max_length = args.esm_max_length
         self.esm_forward_lock = getattr(args, "esm_forward_lock", None)
+        from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
+
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
         self.esm = (esm or AutoModel.from_pretrained(model_name)).to(self.device)
         self.esm.eval()
@@ -426,6 +428,7 @@ class FrozenESMModel:
         if not sequences:
             return self._compute_sequence_representations(sequences)
 
+        start_time = time.time()
         unique_sequences = list(dict.fromkeys(sequences))
         cacheable_sequences = [
             sequence
@@ -470,7 +473,18 @@ class FrozenESMModel:
         ordered_embeddings = [
             embeddings_by_sequence[sequence] for sequence in sequences
         ]
-        return torch.stack(ordered_embeddings, dim=0)
+        stacked = torch.stack(ordered_embeddings, dim=0)
+        elapsed = time.time() - start_time
+        if elapsed >= 5:
+            logger.info(
+                "Loaded %d sequence representations in %.2fs (%d unique, %d cacheable, %d non-cacheable)",
+                len(sequences),
+                elapsed,
+                len(unique_sequences),
+                len(cacheable_sequences),
+                len(non_cacheable_sequences),
+            )
+        return stacked
 
     def _prepare_net_inputs(self, sequence_representations, sequences=None):
         return sequence_representations
@@ -504,14 +518,20 @@ class FrozenESMModel:
         num_no_improvement = 0
 
         for epoch in range(self.args.num_model_max_epochs):
+            if epoch == 0 or not (epoch + 1) % 10:
+                logger.info("Starting epoch %d", epoch + 1)
             self.net.train()
-            for data in loader_train:
+            for batch_idx, data in enumerate(loader_train):
+                if epoch == 0 and batch_idx == 0:
+                    logger.info("Reached first training batch")
                 loss = self.compute_loss(data)
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
 
             if not (epoch + 1) % self.args.epochs_per_valid:
+                if epoch == 0:
+                    logger.info("Reached first validation pass")
                 self.net.eval()
                 valid_losses = []
                 with torch.no_grad():
@@ -654,7 +674,15 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
 
     def compute_loss(self, data):
         sequences, labels = data
+        batch_start = time.time()
         sequence_representations = self.get_sequence_representations(sequences)
+        rep_elapsed = time.time() - batch_start
+        if rep_elapsed >= 5:
+            logger.info(
+                "Per-residue representation load for batch of %d sequences took %.2fs",
+                len(sequences),
+                rep_elapsed,
+            )
         return super().compute_loss((sequence_representations, labels, sequences))
 
     def get_residue_sequence_embeddings(self, sequences):
@@ -696,9 +724,30 @@ class SharedESMComponents:
 
 
 def prepare_shared_esm_components(args):
+    from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer = AutoTokenizer.from_pretrained(args.esm_model_name)
-    esm = AutoModel.from_pretrained(args.esm_model_name).to(device)
+    print("[shared-esm] loading tokenizer from local cache", flush=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.esm_model_name,
+            local_files_only=True,
+        )
+    except Exception:
+        print("[shared-esm] local tokenizer cache miss, falling back to hub", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.esm_model_name)
+
+    print("[shared-esm] loading model from local cache", flush=True)
+    try:
+        esm = AutoModel.from_pretrained(
+            args.esm_model_name,
+            local_files_only=True,
+        ).to(device)
+    except Exception:
+        print("[shared-esm] local model cache miss, falling back to hub", flush=True)
+        esm = AutoModel.from_pretrained(args.esm_model_name).to(device)
+
+    print(f"[shared-esm] shared ESM model loaded on {device}", flush=True)
     esm.eval()
     for param in esm.parameters():
         param.requires_grad = False

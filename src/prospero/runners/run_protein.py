@@ -1,6 +1,5 @@
 import sys
 import os
-from evodiff.pretrained import OA_DM_38M  # type: ignore[reportMissingImports]
 from prospero.experiments_config import ALPHABETS, WT_SEQUENCES
 
 
@@ -90,6 +89,7 @@ def get_parser():
         default=None,
         help="Optional max tokenized sequence length for ESM inputs",
     )
+    parser.add_argument("--disable-esm-cache", action="store_true", default=False)
 
     return parser
 
@@ -107,10 +107,13 @@ def run_iter(args, logger, shared_esm_components=None):
     wt_sequence = WT_SEQUENCES[args.task]
     oracle = get_landscape(args.task)
     dataset = RegressionDataset(args.task)
-    initial_dataset_sequences = set(
-        normalize_sequences(list(dataset.train) + list(dataset.valid))
-    )
-    args.cache_allowed_sequences = initial_dataset_sequences
+    if args.disable_esm_cache:
+        args.cache_allowed_sequences = set()
+    else:
+        initial_dataset_sequences = set(
+            normalize_sequences(list(dataset.train) + list(dataset.valid))
+        )
+        args.cache_allowed_sequences = initial_dataset_sequences
 
     if (
         shared_esm_components is None
@@ -133,6 +136,8 @@ def run_iter(args, logger, shared_esm_components=None):
     logger.info("Training finished")
 
     alphabet = ALPHABETS[args.alphabet]
+
+    from evodiff.pretrained import OA_DM_38M  # type: ignore[reportMissingImports]
 
     model, _, tokenizer_oadm, _ = OA_DM_38M()
     model = model.cuda()
