@@ -94,6 +94,8 @@ def _build_protein_args(
     protein_args.esm_cnn_projection_dim = runner_args.esm_cnn_projection_dim
     protein_args.esm_cnn_use_layernorm = runner_args.esm_cnn_use_layernorm
     protein_args.esm_cnn_concat_one_hot = runner_args.esm_cnn_concat_one_hot
+    protein_args.esm_model_name = runner_args.esm_model_name
+    protein_args.esm_max_length = runner_args.esm_max_length
     return protein_args
 
 
@@ -118,6 +120,11 @@ def main() -> None:
     parser.add_argument("--esm-cnn-projection-dim", type=int, default=None)
     parser.add_argument("--esm-cnn-use-layernorm", action="store_true", default=False)
     parser.add_argument("--esm-cnn-concat-one-hot", action="store_true", default=False)
+    parser.add_argument(
+        "--esm-model-name",
+        default="facebook/esm2_t6_8M_UR50D",
+    )
+    parser.add_argument("--esm-max-length", type=int, default=None)
     parser.add_argument("--n-samples", default="8,16,32,64,128")
     parser.add_argument("--seeds", default="1,2,3,4,5")
     parser.add_argument("--n-iters", type=int, default=10)
