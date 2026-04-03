@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
 from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.preprocessing import StandardScaler
 
 from .esm.cache import ESMEmbeddingFileCache
 
@@ -340,8 +342,8 @@ class FrozenESMModel:
     def __init__(
         self,
         args,
-        build_net,
         representation_name,
+        build_net=None,
         tokenizer=None,
         esm=None,
         cache_allowed_sequences=None,
@@ -361,25 +363,31 @@ class FrozenESMModel:
 
         embedding_dim = self.esm.config.hidden_size
         self.embedding_dim = embedding_dim
-        self.embedding_cache = ESMEmbeddingFileCache(
-            model_name=model_name,
-            max_length=self.max_length,
-            representation_name=representation_name,
-            cache_root=get_esm_embedding_cache_path(),
-        )
+        self.embedding_cache = None
         # Full-cache mode is intentionally disabled to avoid unbounded cache growth.
         # If no whitelist is provided, no sequence is cacheable.
         self.cache_allowed_sequences = (
             set(cache_allowed_sequences) if cache_allowed_sequences is not None else set()
         )
-        self.net = build_net(embedding_dim).to(self.device)
-        trainable_parameters = [
-            param for param in self.net.parameters() if param.requires_grad
-        ]
-        self.optimizer = torch.optim.Adam(
-            trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
-        )
-        self.loss_func = torch.nn.MSELoss()
+        if self.cache_allowed_sequences:
+            self.embedding_cache = ESMEmbeddingFileCache(
+                model_name=model_name,
+                max_length=self.max_length,
+                representation_name=representation_name,
+                cache_root=get_esm_embedding_cache_path(),
+            )
+        self.net = None
+        self.optimizer = None
+        self.loss_func = None
+        if build_net is not None:
+            self.net = build_net(embedding_dim).to(self.device)
+            trainable_parameters = [
+                param for param in self.net.parameters() if param.requires_grad
+            ]
+            self.optimizer = torch.optim.Adam(
+                trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
+            )
+            self.loss_func = torch.nn.MSELoss()
 
     def get_data_loader(self, sequences, labels, shuffle):
         normalized_sequences = normalize_sequences(sequences)
@@ -440,13 +448,13 @@ class FrozenESMModel:
 
         embeddings_by_sequence = {}
         missing_cacheable_sequences = []
-        if cacheable_sequences:
+        if cacheable_sequences and self.embedding_cache is not None:
             (
                 embeddings_by_sequence,
                 missing_cacheable_sequences,
             ) = self.embedding_cache.get_many(cacheable_sequences)
 
-        if missing_cacheable_sequences:
+        if missing_cacheable_sequences and self.embedding_cache is not None:
             missing_embeddings = self._compute_sequence_representations(
                 missing_cacheable_sequences
             )
@@ -661,8 +669,113 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
         return self.get_sequence_representations(sequences)
 
 
+class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
+    def __init__(
+        self,
+        seq_length,
+        args,
+        regression_type,
+        tokenizer=None,
+        esm=None,
+        **kwargs,
+    ):
+        self.seq_length = seq_length
+        self.alphabet = "ACDEFGHIKLMNPQRSTVWY"
+        self.regression_type = regression_type
+        super().__init__(
+            args,
+            build_net=None,
+            representation_name="per_residue_embeddings_v1",
+            tokenizer=tokenizer,
+            esm=esm,
+            **kwargs,
+        )
+        self.scaler = StandardScaler()
+        if regression_type == "ridge":
+            self.regressor = Ridge(
+                alpha=args.ridge_alpha,
+                fit_intercept=args.ridge_fit_intercept,
+            )
+        elif regression_type == "linear":
+            self.regressor = LinearRegression(
+                fit_intercept=args.ridge_fit_intercept
+            )
+        else:
+            raise ValueError(f"Unsupported regression_type={regression_type}")
+        self._is_fitted = False
+
+    def _compute_sequence_representations(self, sequences):
+        if not sequences:
+            return torch.empty(
+                (0, self.seq_length, self.embedding_dim), dtype=torch.float32
+            )
+
+        residue_sequence_embeddings = []
+        batch_size = self.args.proxy_batch_size
+        for start in range(0, len(sequences), batch_size):
+            batch_sequences = sequences[start : start + batch_size]
+            input_ids, attention_mask = self._tokenize_batch(batch_sequences)
+            attention_mask = attention_mask.to(self.device)
+            with torch.no_grad():
+                sequence_embeddings = self._esm_forward(input_ids, attention_mask)
+                batch_embeddings = extract_residue_embeddings(
+                    sequence_embeddings,
+                    attention_mask,
+                    expected_sequence_length=self.seq_length,
+                )
+            residue_sequence_embeddings.append(batch_embeddings.cpu())
+
+        return torch.cat(residue_sequence_embeddings, dim=0)
+
+    def _build_features(self, sequence_representations, sequences):
+        flattened_embeddings = (
+            sequence_representations.reshape(sequence_representations.shape[0], -1)
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        one_hots = sequences_to_tensor(sequences, self.alphabet)
+        flattened_one_hots = (
+            torch.permute(one_hots, [0, 2, 1])
+            .contiguous()
+            .reshape(one_hots.shape[0], -1)
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+        return np.concatenate([flattened_embeddings, flattened_one_hots], axis=1)
+
+    def train(self, dataset):
+        train_sequences = normalize_sequences(dataset.train)
+        train_representations = self.get_sequence_representations(train_sequences)
+        train_features = self._build_features(train_representations, train_sequences)
+        train_labels = np.asarray(dataset.train_scores, dtype=np.float32)
+
+        scaled_train_features = self.scaler.fit_transform(train_features)
+        self.regressor.fit(scaled_train_features, train_labels)
+        self._is_fitted = True
+
+    def get_fitness(self, sequences):
+        if not self._is_fitted:
+            raise RuntimeError("Regressor has not been fitted. Call train() first.")
+
+        normalized_sequences = normalize_sequences(sequences)
+        sequence_representations = self.get_sequence_representations(
+            normalized_sequences
+        )
+        features = self._build_features(sequence_representations, normalized_sequences)
+        scaled_features = self.scaler.transform(features)
+        predictions = self.regressor.predict(scaled_features).astype(np.float32)
+        return torch.from_numpy(predictions).to(self.device)
+
+
 def build_surrogate_model(seq_length, args, shared_esm_components=None):
-    if args.surrogate_arch in {"frozen_esm_mlp", "frozen_esm_cnn"}:
+    if args.surrogate_arch in {
+        "frozen_esm_mlp",
+        "frozen_esm_cnn",
+        "frozen_esm_flat_linear",
+        "frozen_esm_flat_ridge",
+    }:
         tokenizer = None
         esm = None
         esm_forward_lock = None
@@ -674,6 +787,24 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
         if args.surrogate_arch == "frozen_esm_mlp":
             return FrozenESMMeanPooledModel(
                 args,
+                tokenizer=tokenizer,
+                esm=esm,
+                cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
+            )
+        if args.surrogate_arch == "frozen_esm_flat_linear":
+            return FrozenESMFlattenedOneHotSklearnModel(
+                seq_length,
+                args,
+                regression_type="linear",
+                tokenizer=tokenizer,
+                esm=esm,
+                cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
+            )
+        if args.surrogate_arch == "frozen_esm_flat_ridge":
+            return FrozenESMFlattenedOneHotSklearnModel(
+                seq_length,
+                args,
+                regression_type="ridge",
                 tokenizer=tokenizer,
                 esm=esm,
                 cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),

@@ -33,7 +33,12 @@ logging.basicConfig(
 )
 
 
-FROZEN_ESM_SURROGATE_ARCHS = {"frozen_esm_mlp", "frozen_esm_cnn"}
+FROZEN_ESM_SURROGATE_ARCHS = {
+    "frozen_esm_mlp",
+    "frozen_esm_cnn",
+    "frozen_esm_flat_linear",
+    "frozen_esm_flat_ridge",
+}
 
 
 def get_parser():
@@ -71,7 +76,13 @@ def get_parser():
     parser.add_argument(
         "--surrogate_arch",
         type=str,
-        choices=["cnn", "frozen_esm_mlp", "frozen_esm_cnn"],
+        choices=[
+            "cnn",
+            "frozen_esm_mlp",
+            "frozen_esm_cnn",
+            "frozen_esm_flat_linear",
+            "frozen_esm_flat_ridge",
+        ],
         default="cnn",
     )
     parser.add_argument(
@@ -90,6 +101,19 @@ def get_parser():
         default=None,
         help="Optional max tokenized sequence length for ESM inputs",
     )
+    parser.add_argument(
+        "--ridge_alpha",
+        type=float,
+        default=1.0,
+        help="Ridge regularization strength for frozen_esm_flat_ridge.",
+    )
+    parser.add_argument(
+        "--ridge_fit_intercept",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether sklearn linear/ridge surrogate fits an intercept.",
+    )
+    parser.add_argument("--disable-esm-cache", action="store_true", default=False)
 
     return parser
 
@@ -107,10 +131,13 @@ def run_iter(args, logger, shared_esm_components=None):
     wt_sequence = WT_SEQUENCES[args.task]
     oracle = get_landscape(args.task)
     dataset = RegressionDataset(args.task)
-    initial_dataset_sequences = set(
-        normalize_sequences(list(dataset.train) + list(dataset.valid))
-    )
-    args.cache_allowed_sequences = initial_dataset_sequences
+    if args.disable_esm_cache:
+        args.cache_allowed_sequences = set()
+    else:
+        initial_dataset_sequences = set(
+            normalize_sequences(list(dataset.train) + list(dataset.valid))
+        )
+        args.cache_allowed_sequences = initial_dataset_sequences
 
     if (
         shared_esm_components is None

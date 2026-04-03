@@ -96,6 +96,9 @@ def _build_protein_args(
     protein_args.esm_cnn_concat_one_hot = runner_args.esm_cnn_concat_one_hot
     protein_args.esm_model_name = runner_args.esm_model_name
     protein_args.esm_max_length = runner_args.esm_max_length
+    protein_args.ridge_alpha = runner_args.ridge_alpha
+    protein_args.ridge_fit_intercept = runner_args.ridge_fit_intercept
+    protein_args.disable_esm_cache = runner_args.disable_esm_cache
     return protein_args
 
 
@@ -115,7 +118,13 @@ def main() -> None:
     parser.add_argument(
         "--surrogate-arch",
         default="cnn",
-        choices=("cnn", "frozen_esm_mlp", "frozen_esm_cnn"),
+        choices=(
+            "cnn",
+            "frozen_esm_mlp",
+            "frozen_esm_cnn",
+            "frozen_esm_flat_linear",
+            "frozen_esm_flat_ridge",
+        ),
     )
     parser.add_argument("--esm-cnn-projection-dim", type=int, default=None)
     parser.add_argument("--esm-cnn-use-layernorm", action="store_true", default=False)
@@ -125,6 +134,13 @@ def main() -> None:
         default="facebook/esm2_t6_8M_UR50D",
     )
     parser.add_argument("--esm-max-length", type=int, default=None)
+    parser.add_argument("--ridge-alpha", type=float, default=1.0)
+    parser.add_argument(
+        "--ridge-fit-intercept",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--disable-esm-cache", action="store_true", default=False)
     parser.add_argument("--n-samples", default="8,16,32,64,128")
     parser.add_argument("--seeds", default="1,2,3,4,5")
     parser.add_argument("--n-iters", type=int, default=10)
@@ -197,6 +213,11 @@ def main() -> None:
                         else n_samples
                     )
                     cmd_template.extend(["--n_queries", str(n_queries)])
+                    cmd_template.extend(["--ridge_alpha", str(args.ridge_alpha)])
+                    if not args.ridge_fit_intercept:
+                        cmd_template.append("--no-ridge_fit_intercept")
+                    if args.disable_esm_cache:
+                        cmd_template.append("--disable-esm-cache")
 
                     env = os.environ.copy()
                     if args.uv_cache_dir:

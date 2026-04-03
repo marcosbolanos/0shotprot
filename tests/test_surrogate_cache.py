@@ -72,6 +72,8 @@ def make_args(**overrides):
         "num_model_max_epochs": 3,
         "epochs_per_valid": 1,
         "patience": 5,
+        "ridge_alpha": 1.0,
+        "ridge_fit_intercept": True,
     }
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -240,3 +242,46 @@ def test_frozen_esm_cnn_can_concatenate_one_hot_inputs(monkeypatch, tmp_path):
     assert fake_esm.forward_call_count == 1
     assert model.net.conv_1.in_channels == 26
     assert predictions.shape == (2,)
+
+
+@pytest.mark.parametrize(
+    "surrogate_arch",
+    ["frozen_esm_flat_linear", "frozen_esm_flat_ridge"],
+)
+def test_flattened_one_hot_sklearn_surrogate_fit_predict(
+    monkeypatch, tmp_path, surrogate_arch
+):
+    fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        surrogate.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        surrogate.AutoModel,
+        "from_pretrained",
+        lambda model_name: fake_esm,
+    )
+
+    args = make_args(
+        surrogate_arch=surrogate_arch,
+        proxy_batch_size=2,
+    )
+    model = surrogate.build_surrogate_model(5, args)
+
+    dataset = SimpleNamespace(
+        train=np.array(["ACDEF", "AAAAC", "CCCCC"], dtype=object),
+        train_scores=np.array([1.0, 2.0, 0.5], dtype=np.float32),
+        valid=np.array(["DDDDE"], dtype=object),
+        valid_scores=np.array([0.2], dtype=np.float32),
+    )
+    model.train(dataset)
+    predictions = model.get_fitness(["ACDEF", "DDDDE"])
+
+    assert predictions.shape == (2,)
+    assert torch.isfinite(predictions).all()
+    # Cache disabled by default unless an allowlist is provided.
+    assert not (tmp_path / "esm_embeddings").exists()
