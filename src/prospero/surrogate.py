@@ -168,36 +168,42 @@ class SharedESMBatchWorker:
             sequences.extend(request.sequences)
 
         first = batch[0]
-        tokenizer_kwargs = {
-            "return_tensors": "pt",
-            "padding": True,
-            "truncation": first.max_length is not None,
-        }
-        if first.max_length is not None:
-            tokenizer_kwargs["max_length"] = first.max_length
+        all_representations = []
+        for start_idx in range(0, len(sequences), self.max_batch_sequences):
+            chunk_sequences = sequences[start_idx : start_idx + self.max_batch_sequences]
+            tokenizer_kwargs = {
+                "return_tensors": "pt",
+                "padding": True,
+                "truncation": first.max_length is not None,
+            }
+            if first.max_length is not None:
+                tokenizer_kwargs["max_length"] = first.max_length
 
-        encoded = self.tokenizer(sequences, **tokenizer_kwargs)
-        input_ids = encoded["input_ids"]
-        attention_mask = encoded["attention_mask"]
-        with torch.no_grad():
-            sequence_embeddings = self.esm(
-                input_ids=input_ids.to(self.device),
-                attention_mask=attention_mask.to(self.device),
-            ).last_hidden_state
-            if first.representation_name == "mean_pool_residue_embeddings_v1":
-                representations = mean_pool_residue_embeddings(
-                    sequence_embeddings, attention_mask.to(self.device)
-                ).cpu()
-            elif first.representation_name == "per_residue_embeddings_v1":
-                representations = extract_residue_embeddings(
-                    sequence_embeddings,
-                    attention_mask.to(self.device),
-                    expected_sequence_length=first.expected_sequence_length,
-                ).cpu()
-            else:
-                raise ValueError(
-                    f"Unsupported representation in shared worker: {first.representation_name}"
-                )
+            encoded = self.tokenizer(chunk_sequences, **tokenizer_kwargs)
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded["attention_mask"]
+            with torch.no_grad():
+                sequence_embeddings = self.esm(
+                    input_ids=input_ids.to(self.device),
+                    attention_mask=attention_mask.to(self.device),
+                ).last_hidden_state
+                if first.representation_name == "mean_pool_residue_embeddings_v1":
+                    chunk_representations = mean_pool_residue_embeddings(
+                        sequence_embeddings, attention_mask.to(self.device)
+                    ).cpu()
+                elif first.representation_name == "per_residue_embeddings_v1":
+                    chunk_representations = extract_residue_embeddings(
+                        sequence_embeddings,
+                        attention_mask.to(self.device),
+                        expected_sequence_length=first.expected_sequence_length,
+                    ).cpu()
+                else:
+                    raise ValueError(
+                        f"Unsupported representation in shared worker: {first.representation_name}"
+                    )
+            all_representations.append(chunk_representations)
+
+        representations = torch.cat(all_representations, dim=0)
 
         start = 0
         for request, size in zip(batch, sizes):
@@ -955,6 +961,14 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
         if not sequences:
             return torch.empty(
                 (0, self.seq_length, self.embedding_dim), dtype=torch.float32
+            )
+
+        if self.esm_batch_worker is not None:
+            return self.esm_batch_worker.compute(
+                sequences=sequences,
+                representation_name="per_residue_embeddings_v1",
+                max_length=self.max_length,
+                expected_sequence_length=self.seq_length,
             )
 
         residue_sequence_embeddings = []
