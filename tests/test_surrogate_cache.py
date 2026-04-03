@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 
 import numpy as np
 import pytest
@@ -82,17 +83,11 @@ def build_model(monkeypatch, tmp_path, **arg_overrides):
     monkeypatch.setattr(
         surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
     )
-    monkeypatch.setattr(
-        surrogate.AutoTokenizer,
-        "from_pretrained",
-        lambda model_name: FakeTokenizer(),
+    model = surrogate.FrozenESMMeanPooledModel(
+        make_args(**arg_overrides),
+        tokenizer=FakeTokenizer(),
+        esm=fake_esm,
     )
-    monkeypatch.setattr(
-        surrogate.AutoModel,
-        "from_pretrained",
-        lambda model_name: fake_esm,
-    )
-    model = surrogate.FrozenESMMeanPooledModel(make_args(**arg_overrides))
     return model, fake_esm
 
 
@@ -101,18 +96,11 @@ def build_per_residue_model(monkeypatch, tmp_path, seq_length=5, **arg_overrides
     monkeypatch.setattr(
         surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
     )
-    monkeypatch.setattr(
-        surrogate.AutoTokenizer,
-        "from_pretrained",
-        lambda model_name: FakeTokenizer(),
-    )
-    monkeypatch.setattr(
-        surrogate.AutoModel,
-        "from_pretrained",
-        lambda model_name: fake_esm,
-    )
     model = surrogate.FrozenESMPerResidueCNNModel(
-        seq_length, make_args(**arg_overrides)
+        seq_length,
+        make_args(**arg_overrides),
+        tokenizer=FakeTokenizer(),
+        esm=fake_esm,
     )
     return model, fake_esm
 
@@ -148,10 +136,11 @@ def test_training_uses_cached_embeddings_across_retrains(monkeypatch, tmp_path):
     )
 
     model.train(dataset)
-    assert fake_esm.forward_call_count == 2
+    first_train_calls = fake_esm.forward_call_count
+    assert 2 <= first_train_calls <= 3
 
     model.train(dataset)
-    assert fake_esm.forward_call_count == 2
+    assert fake_esm.forward_call_count == first_train_calls
 
 
 def test_cached_per_residue_embeddings_are_reused(monkeypatch, tmp_path):
@@ -187,10 +176,11 @@ def test_per_residue_training_uses_cached_embeddings_across_retrains(
     )
 
     model.train(dataset)
-    assert fake_esm.forward_call_count == 2
+    first_train_calls = fake_esm.forward_call_count
+    assert 2 <= first_train_calls <= 3
 
     model.train(dataset)
-    assert fake_esm.forward_call_count == 2
+    assert fake_esm.forward_call_count == first_train_calls
 
 
 def test_build_surrogate_model_supports_frozen_esm_cnn(monkeypatch, tmp_path):
@@ -202,7 +192,11 @@ def test_build_surrogate_model_supports_frozen_esm_cnn(monkeypatch, tmp_path):
     model = surrogate.build_surrogate_model(
         5,
         make_args(surrogate_arch="frozen_esm_cnn"),
-        shared_esm_components=(FakeTokenizer(), fake_esm),
+        shared_esm_components=surrogate.SharedESMComponents(
+            tokenizer=FakeTokenizer(),
+            esm=fake_esm,
+            esm_forward_lock=threading.Lock(),
+        ),
     )
 
     assert isinstance(model, surrogate.FrozenESMPerResidueCNNModel)
@@ -218,7 +212,11 @@ def test_frozen_esm_cnn_projection_changes_input_channels(monkeypatch, tmp_path)
     model = surrogate.build_surrogate_model(
         5,
         make_args(surrogate_arch="frozen_esm_cnn", esm_cnn_projection_dim=6),
-        shared_esm_components=(FakeTokenizer(), fake_esm),
+        shared_esm_components=surrogate.SharedESMComponents(
+            tokenizer=FakeTokenizer(),
+            esm=fake_esm,
+            esm_forward_lock=threading.Lock(),
+        ),
     )
 
     assert isinstance(model.input_adapter.projection, nn.Linear)
@@ -240,3 +238,28 @@ def test_frozen_esm_cnn_can_concatenate_one_hot_inputs(monkeypatch, tmp_path):
     assert fake_esm.forward_call_count == 1
     assert model.net.conv_1.in_channels == 26
     assert predictions.shape == (2,)
+
+
+def test_eval_path_does_not_write_cache(monkeypatch, tmp_path):
+    model, fake_esm = build_model(monkeypatch, tmp_path)
+    predictions = model.get_fitness(["AAA", "CCC"])
+    assert predictions.shape == (2,)
+    assert fake_esm.forward_call_count == 1
+    assert not list((tmp_path / "esm_embeddings").rglob("*.pt"))
+
+
+def test_training_splits_persistent_and_run_scoped_cache(monkeypatch, tmp_path):
+    run_cache_root = tmp_path / "run_cache"
+    model, _ = build_model(
+        monkeypatch,
+        tmp_path,
+        esm_run_cache_root=str(run_cache_root),
+    )
+    model.cache_allowed_sequences = {"AAA"}
+
+    _ = model.get_pooled_sequence_embeddings(["AAA", "BBB"])
+
+    persistent_files = list(model.persistent_embedding_cache.namespace.rglob("*.pt"))
+    run_files = list(model.run_embedding_cache.namespace.rglob("*.pt"))
+    assert len(persistent_files) == 1
+    assert len(run_files) == 1

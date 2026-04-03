@@ -40,7 +40,8 @@ class TeeStream:
 class SharedESMComponents:
     tokenizer: object
     esm: object
-    esm_forward_lock: threading.Lock
+    esm_forward_lock: object | None = None
+    esm_batch_worker: object | None = None
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -81,6 +82,7 @@ def run_seed(process_args: Sequence[str], env: dict[str, str]) -> None:
 def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponents:
     import torch
     from transformers import AutoModel, AutoTokenizer
+    from prospero.surrogate import SharedESMBatchWorker
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[shared-esm] loading tokenizer from local cache", flush=True)
@@ -107,10 +109,18 @@ def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponen
     esm.eval()
     for param in esm.parameters():
         param.requires_grad = False
+    esm_batch_worker = SharedESMBatchWorker(
+        tokenizer=tokenizer,
+        esm=esm,
+        device=device,
+        max_batch_sequences=512,
+        max_wait_ms=4.0,
+    )
     return SharedESMComponents(
         tokenizer=tokenizer,
         esm=esm,
-        esm_forward_lock=threading.Lock(),
+        esm_forward_lock=None,
+        esm_batch_worker=esm_batch_worker,
     )
 
 
@@ -301,6 +311,7 @@ def main() -> None:
                             max_workers=executor_workers
                         ) as executor:
                             future_to_cmd = {}
+                            shared_esm_components = None
                             if (
                                 args.surrogate_arch in frozen_esm_surrogate_archs
                                 and args.share_frozen_esm
@@ -333,21 +344,31 @@ def main() -> None:
                                     future_to_cmd[future] = (
                                         f"in-process run_protein seed={seed}",
                                     )
-                            else:
-                                future_to_cmd = {
-                                    executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
-                                    for cmd in seed_cmds
-                                }
-                            for future in concurrent.futures.as_completed(future_to_cmd):
-                                cmd = future_to_cmd[future]
-                                try:
-                                    future.result()
-                                except (
-                                    Exception
-                                ) as exc:  # include subprocess.CalledProcessError
-                                    errors.append((cmd, exc))
-                                finally:
-                                    progress.update(1)
+                            try:
+                                if not (
+                                    args.surrogate_arch in frozen_esm_surrogate_archs
+                                    and args.share_frozen_esm
+                                ):
+                                    future_to_cmd = {
+                                        executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
+                                        for cmd in seed_cmds
+                                    }
+                                for future in concurrent.futures.as_completed(future_to_cmd):
+                                    cmd = future_to_cmd[future]
+                                    try:
+                                        future.result()
+                                    except (
+                                        Exception
+                                    ) as exc:  # include subprocess.CalledProcessError
+                                        errors.append((cmd, exc))
+                                    finally:
+                                        progress.update(1)
+                            finally:
+                                if (
+                                    shared_esm_components is not None
+                                    and shared_esm_components.esm_batch_worker is not None
+                                ):
+                                    shared_esm_components.esm_batch_worker.close()
 
                     if errors:
                         for cmd, exc in errors:

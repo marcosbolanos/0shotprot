@@ -8,7 +8,9 @@ import hashlib
 import threading
 import time
 from dataclasses import dataclass
+from concurrent.futures import Future
 from pathlib import Path
+from enum import Enum
 from time import sleep
 
 from .esm.cache import ESMEmbeddingFileCache
@@ -20,6 +22,187 @@ logging.basicConfig(
     format="%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
 )
+
+
+@dataclass
+class _ESMBatchRequest:
+    sequences: list[str]
+    representation_name: str
+    max_length: int | None
+    expected_sequence_length: int | None
+    future: Future
+
+
+class SharedESMBatchWorker:
+    def __init__(
+        self,
+        tokenizer,
+        esm,
+        device,
+        max_batch_sequences=512,
+        max_wait_ms=4.0,
+    ):
+        self.tokenizer = tokenizer
+        self.esm = esm
+        self.device = device
+        self.max_batch_sequences = max(1, int(max_batch_sequences))
+        self.max_wait_seconds = max(0.0, float(max_wait_ms) / 1000.0)
+        self._pending = []
+        self._condition = threading.Condition()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="shared-esm-batch-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        self._thread.join(timeout=5.0)
+
+    def submit(
+        self,
+        sequences,
+        representation_name,
+        max_length=None,
+        expected_sequence_length=None,
+    ):
+        request = _ESMBatchRequest(
+            sequences=list(sequences),
+            representation_name=representation_name,
+            max_length=max_length,
+            expected_sequence_length=expected_sequence_length,
+            future=Future(),
+        )
+        with self._condition:
+            if self._closed:
+                request.future.set_exception(RuntimeError("Shared ESM worker is closed."))
+            else:
+                self._pending.append(request)
+                self._condition.notify()
+        return request.future
+
+    def compute(
+        self,
+        sequences,
+        representation_name,
+        max_length=None,
+        expected_sequence_length=None,
+    ):
+        future = self.submit(
+            sequences=sequences,
+            representation_name=representation_name,
+            max_length=max_length,
+            expected_sequence_length=expected_sequence_length,
+        )
+        return future.result()
+
+    def _compatible(self, lhs: _ESMBatchRequest, rhs: _ESMBatchRequest):
+        return (
+            lhs.representation_name == rhs.representation_name
+            and lhs.max_length == rhs.max_length
+            and lhs.expected_sequence_length == rhs.expected_sequence_length
+        )
+
+    def _pop_compatible_requests(self, first: _ESMBatchRequest):
+        batch = [first]
+        total_sequences = len(first.sequences)
+        deadline = time.monotonic() + self.max_wait_seconds
+        while total_sequences < self.max_batch_sequences:
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                break
+            if not self._pending:
+                self._condition.wait(timeout=remaining)
+                if not self._pending:
+                    break
+
+            matched_index = None
+            for index, candidate in enumerate(self._pending):
+                if not self._compatible(first, candidate):
+                    continue
+                if total_sequences + len(candidate.sequences) > self.max_batch_sequences:
+                    continue
+                matched_index = index
+                break
+
+            if matched_index is None:
+                break
+
+            matched = self._pending.pop(matched_index)
+            batch.append(matched)
+            total_sequences += len(matched.sequences)
+        return batch
+
+    def _run(self):
+        while True:
+            with self._condition:
+                while not self._pending and not self._closed:
+                    self._condition.wait()
+                if self._closed and not self._pending:
+                    return
+                first = self._pending.pop(0)
+                batch = self._pop_compatible_requests(first)
+
+            try:
+                self._process_batch(batch)
+            except Exception as exc:
+                for request in batch:
+                    if not request.future.done():
+                        request.future.set_exception(exc)
+
+    def _process_batch(self, batch: list[_ESMBatchRequest]):
+        if not batch:
+            return
+
+        sequences = []
+        sizes = []
+        for request in batch:
+            sizes.append(len(request.sequences))
+            sequences.extend(request.sequences)
+
+        first = batch[0]
+        tokenizer_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+            "truncation": first.max_length is not None,
+        }
+        if first.max_length is not None:
+            tokenizer_kwargs["max_length"] = first.max_length
+
+        encoded = self.tokenizer(sequences, **tokenizer_kwargs)
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        with torch.no_grad():
+            sequence_embeddings = self.esm(
+                input_ids=input_ids.to(self.device),
+                attention_mask=attention_mask.to(self.device),
+            ).last_hidden_state
+            if first.representation_name == "mean_pool_residue_embeddings_v1":
+                representations = mean_pool_residue_embeddings(
+                    sequence_embeddings, attention_mask.to(self.device)
+                ).cpu()
+            elif first.representation_name == "per_residue_embeddings_v1":
+                representations = extract_residue_embeddings(
+                    sequence_embeddings,
+                    attention_mask.to(self.device),
+                    expected_sequence_length=first.expected_sequence_length,
+                ).cpu()
+            else:
+                raise ValueError(
+                    f"Unsupported representation in shared worker: {first.representation_name}"
+                )
+
+        start = 0
+        for request, size in zip(batch, sizes):
+            end = start + size
+            if not request.future.done():
+                request.future.set_result(representations[start:end])
+            start = end
 
 
 def sequence_to_one_hot(sequence, alphabet):
@@ -337,6 +520,10 @@ class ConvolutionalNetworkModel(TorchModel):
 
 
 class FrozenESMModel:
+    class CacheMode(Enum):
+        TRAIN = "train"
+        EVAL = "eval"
+
     def __init__(
         self,
         args,
@@ -353,6 +540,7 @@ class FrozenESMModel:
         model_name = args.esm_model_name
         self.max_length = args.esm_max_length
         self.esm_forward_lock = getattr(args, "esm_forward_lock", None)
+        self.esm_batch_worker = getattr(args, "esm_batch_worker", None)
         from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
@@ -363,14 +551,27 @@ class FrozenESMModel:
 
         embedding_dim = self.esm.config.hidden_size
         self.embedding_dim = embedding_dim
-        self.embedding_cache = ESMEmbeddingFileCache(
+        self.persistent_embedding_cache = ESMEmbeddingFileCache(
             model_name=model_name,
             max_length=self.max_length,
             representation_name=representation_name,
             cache_root=get_esm_embedding_cache_path(),
+            max_disk_bytes=0,
+            max_memory_bytes=512 * 1024 * 1024,
+            storage_dtype="float16",
+            eviction_check_interval=256,
         )
-        # Full-cache mode is intentionally disabled to avoid unbounded cache growth.
-        # If no whitelist is provided, no sequence is cacheable.
+        self.run_embedding_cache = ESMEmbeddingFileCache(
+            model_name=model_name,
+            max_length=self.max_length,
+            representation_name=representation_name,
+            cache_root=getattr(args, "esm_run_cache_root", get_esm_embedding_cache_path()),
+            max_disk_bytes=0,
+            max_memory_bytes=512 * 1024 * 1024,
+            storage_dtype="float16",
+            eviction_check_interval=256,
+        )
+        self.cache_enabled = not getattr(args, "disable_esm_cache", False)
         self.cache_allowed_sequences = (
             set(cache_allowed_sequences) if cache_allowed_sequences is not None else set()
         )
@@ -424,50 +625,53 @@ class FrozenESMModel:
                 attention_mask=attention_mask.to(self.device),
             ).last_hidden_state
 
-    def get_sequence_representations(self, sequences):
+    def get_sequence_representations(self, sequences, cache_mode=CacheMode.TRAIN):
         if not sequences:
+            return self._compute_sequence_representations(sequences)
+        if not self.cache_enabled:
+            return self._compute_sequence_representations(sequences)
+        if cache_mode == FrozenESMModel.CacheMode.EVAL:
             return self._compute_sequence_representations(sequences)
 
         start_time = time.time()
         unique_sequences = list(dict.fromkeys(sequences))
-        cacheable_sequences = [
-            sequence
-            for sequence in unique_sequences
-            if sequence in self.cache_allowed_sequences
-        ]
-        non_cacheable_sequences = [
-            sequence
-            for sequence in unique_sequences
-            if sequence not in self.cache_allowed_sequences
-        ]
-
         embeddings_by_sequence = {}
-        missing_cacheable_sequences = []
-        if cacheable_sequences:
-            (
-                embeddings_by_sequence,
-                missing_cacheable_sequences,
-            ) = self.embedding_cache.get_many(cacheable_sequences)
+        persistent_sequences = [
+            sequence for sequence in unique_sequences if sequence in self.cache_allowed_sequences
+        ]
+        run_scoped_sequences = [
+            sequence for sequence in unique_sequences if sequence not in self.cache_allowed_sequences
+        ]
 
-        if missing_cacheable_sequences:
-            missing_embeddings = self._compute_sequence_representations(
-                missing_cacheable_sequences
+        missing_persistent_sequences = []
+        if persistent_sequences:
+            embeddings_by_sequence, missing_persistent_sequences = (
+                self.persistent_embedding_cache.get_many(persistent_sequences)
             )
-            self.embedding_cache.set_many(
-                missing_cacheable_sequences, missing_embeddings
+        if missing_persistent_sequences:
+            missing_embeddings = self._compute_sequence_representations(
+                missing_persistent_sequences
+            )
+            self.persistent_embedding_cache.set_many(
+                missing_persistent_sequences, missing_embeddings
             )
             for sequence, embedding in zip(
-                missing_cacheable_sequences, missing_embeddings
+                missing_persistent_sequences, missing_embeddings
             ):
                 embeddings_by_sequence[sequence] = embedding
 
-        if non_cacheable_sequences:
-            non_cacheable_embeddings = self._compute_sequence_representations(
-                non_cacheable_sequences
+        missing_run_sequences = []
+        if run_scoped_sequences:
+            run_embeddings, missing_run_sequences = self.run_embedding_cache.get_many(
+                run_scoped_sequences
             )
-            for sequence, embedding in zip(
-                non_cacheable_sequences, non_cacheable_embeddings
-            ):
+            embeddings_by_sequence.update(run_embeddings)
+        if missing_run_sequences:
+            missing_embeddings = self._compute_sequence_representations(
+                missing_run_sequences
+            )
+            self.run_embedding_cache.set_many(missing_run_sequences, missing_embeddings)
+            for sequence, embedding in zip(missing_run_sequences, missing_embeddings):
                 embeddings_by_sequence[sequence] = embedding
 
         ordered_embeddings = [
@@ -481,8 +685,8 @@ class FrozenESMModel:
                 len(sequences),
                 elapsed,
                 len(unique_sequences),
-                len(cacheable_sequences),
-                len(non_cacheable_sequences),
+                len(persistent_sequences),
+                len(run_scoped_sequences),
             )
         return stacked
 
@@ -553,7 +757,8 @@ class FrozenESMModel:
         with torch.no_grad():
             normalized_sequences = normalize_sequences(sequences)
             sequence_representations = self.get_sequence_representations(
-                normalized_sequences
+                normalized_sequences,
+                cache_mode=FrozenESMModel.CacheMode.EVAL,
             )
             predictions = self.net(
                 self._prepare_net_inputs(
@@ -581,6 +786,13 @@ class FrozenESMMeanPooledModel(FrozenESMModel):
     def _compute_sequence_representations(self, sequences):
         if not sequences:
             return torch.empty((0, self.embedding_dim), dtype=torch.float32)
+
+        if self.esm_batch_worker is not None:
+            return self.esm_batch_worker.compute(
+                sequences=sequences,
+                representation_name="mean_pool_residue_embeddings_v1",
+                max_length=self.max_length,
+            )
 
         pooled_sequence_embeddings = []
         batch_size = self.args.proxy_batch_size
@@ -631,6 +843,14 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
         if not sequences:
             return torch.empty(
                 (0, self.seq_length, self.embedding_dim), dtype=torch.float32
+            )
+
+        if self.esm_batch_worker is not None:
+            return self.esm_batch_worker.compute(
+                sequences=sequences,
+                representation_name="per_residue_embeddings_v1",
+                max_length=self.max_length,
+                expected_sequence_length=self.seq_length,
             )
 
         residue_sequence_embeddings = []
@@ -694,11 +914,17 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
         tokenizer = None
         esm = None
         esm_forward_lock = None
+        esm_batch_worker = None
         if shared_esm_components is not None:
-            tokenizer = shared_esm_components.tokenizer
-            esm = shared_esm_components.esm
-            esm_forward_lock = shared_esm_components.esm_forward_lock
+            if hasattr(shared_esm_components, "tokenizer"):
+                tokenizer = shared_esm_components.tokenizer
+                esm = shared_esm_components.esm
+                esm_forward_lock = getattr(shared_esm_components, "esm_forward_lock", None)
+                esm_batch_worker = getattr(shared_esm_components, "esm_batch_worker", None)
+            elif isinstance(shared_esm_components, tuple):
+                tokenizer, esm = shared_esm_components
         args.esm_forward_lock = esm_forward_lock
+        args.esm_batch_worker = esm_batch_worker
         if args.surrogate_arch == "frozen_esm_mlp":
             return FrozenESMMeanPooledModel(
                 args,
@@ -720,7 +946,8 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
 class SharedESMComponents:
     tokenizer: object
     esm: object
-    esm_forward_lock: threading.Lock
+    esm_forward_lock: object | None = None
+    esm_batch_worker: SharedESMBatchWorker | None = None
 
 
 def prepare_shared_esm_components(args):
@@ -751,8 +978,16 @@ def prepare_shared_esm_components(args):
     esm.eval()
     for param in esm.parameters():
         param.requires_grad = False
+    esm_batch_worker = SharedESMBatchWorker(
+        tokenizer=tokenizer,
+        esm=esm,
+        device=device,
+        max_batch_sequences=getattr(args, "shared_esm_max_batch_sequences", 512),
+        max_wait_ms=getattr(args, "shared_esm_max_wait_ms", 4.0),
+    )
     return SharedESMComponents(
         tokenizer=tokenizer,
         esm=esm,
-        esm_forward_lock=threading.Lock(),
+        esm_forward_lock=None,
+        esm_batch_worker=esm_batch_worker,
     )

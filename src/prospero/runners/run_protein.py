@@ -20,6 +20,7 @@ import argparse
 from argparse import ArgumentDefaultsHelpFormatter
 import numpy as np
 from copy import deepcopy
+import tempfile
 
 import logging
 
@@ -98,6 +99,7 @@ def run_iter(args, logger, shared_esm_components=None):
     seed = args.seed
     set_seed(seed, args.full_deterministic)
     logger.info(f"Starting seed {seed}")
+    run_cache_temp_dir = None
 
     save_dir = os.path.join(args.results_dirpath, args.task)
     if not os.path.exists(save_dir):
@@ -114,81 +116,18 @@ def run_iter(args, logger, shared_esm_components=None):
             normalize_sequences(list(dataset.train) + list(dataset.valid))
         )
         args.cache_allowed_sequences = initial_dataset_sequences
-
-    if (
-        shared_esm_components is None
-        and args.surrogate_arch in FROZEN_ESM_SURROGATE_ARCHS
-    ):
-        shared_esm_components = prepare_shared_esm_components(args)
-
-    proxy = Ensemble(
-        [
-            build_surrogate_model(
-                len(wt_sequence),
-                args,
-                shared_esm_components=shared_esm_components,
-            )
-            for _ in range(args.ensemble_size)
-        ]
-    )
-    logger.info("Training started")
-    proxy.train(dataset)
-    logger.info("Training finished")
-
-    alphabet = ALPHABETS[args.alphabet]
-
-    from evodiff.pretrained import OA_DM_38M  # type: ignore[reportMissingImports]
-
-    model, _, tokenizer_oadm, _ = OA_DM_38M()
-    model = model.cuda()
-    exp_tracker = ExperimentTracker(
-        logger, deepcopy(dataset), wt_sequence, best_percentile=0.95
-    )
-
-    starting_sequence = WT_SEQUENCES[args.task]
-
-    for e in range(args.n_iters):
-        # This class implements algos 2, 3 & 4
-        sampler = ProteinSampler(model, tokenizer_oadm, alphabet)
-        sequences = list()
-        ref_sequences = list(dataset.train) + list(
-            dataset.valid
-        )  # So we don't regenerate smth that's already in
-        # generate new sequences
-        while len(sequences) < args.n_queries:  # n_queries is K
-            # This method sequentially runs targeted masking, then SMC
-            sampler.generate_raa_from_alanine_scan(
-                proxy,
-                starting_sequence,
-                args.batch_size,
-                args.resampling_steps,
-                args.min_corruptions,
-                args.max_corruptions,
-                args.kappa_scan,
-                args.n_checks_multiplier,
-                args.kappa_guidance,
-            )
-            # This method is inherited from parent Sampler class
-            sequences += sampler.get_top_sequences(args.n_queries, ref_sequences)
-            ref_sequences += sequences  # add sequences to those we've already seen
-
-        sequences = sequences[: args.n_queries]
-        assert len(sequences) == args.n_queries
-
-        # eval candidate sequences
-        if not args.task.startswith("D_SHIFT"):
-            scores = oracle.get_fitness(np.array(sequences)).tolist()
-        else:
-            scores = oracle.get_fitness(sequences).tolist()
-
-        # append dataset and retrain the surrogate
-        dataset.add((sequences, scores))
-        exp_tracker.calculate_top_n_metrics((sequences, scores), e + 1, n=100)
-        starting_sequence = (
-            get_new_starting_seq(dataset)
-            if not args.task.startswith("D_SHIFT")
-            else get_new_starting_seq_dshift(dataset, args.task)
+        run_cache_temp_dir = tempfile.TemporaryDirectory(
+            prefix=f"prospero_esm_run_seed_{seed}_",
+            dir="/tmp",
         )
+        args.esm_run_cache_root = run_cache_temp_dir.name
+
+    try:
+        if (
+            shared_esm_components is None
+            and args.surrogate_arch in FROZEN_ESM_SURROGATE_ARCHS
+        ):
+            shared_esm_components = prepare_shared_esm_components(args)
 
         proxy = Ensemble(
             [
@@ -200,9 +139,81 @@ def run_iter(args, logger, shared_esm_components=None):
                 for _ in range(args.ensemble_size)
             ]
         )
-        exp_tracker.save_results(save_path)
-        if e + 1 < args.n_iters:
-            proxy.train(dataset)
+        logger.info("Training started")
+        proxy.train(dataset)
+        logger.info("Training finished")
+
+        alphabet = ALPHABETS[args.alphabet]
+
+        from evodiff.pretrained import OA_DM_38M  # type: ignore[reportMissingImports]
+
+        model, _, tokenizer_oadm, _ = OA_DM_38M()
+        model = model.cuda()
+        exp_tracker = ExperimentTracker(
+            logger, deepcopy(dataset), wt_sequence, best_percentile=0.95
+        )
+
+        starting_sequence = WT_SEQUENCES[args.task]
+
+        for e in range(args.n_iters):
+            # This class implements algos 2, 3 & 4
+            sampler = ProteinSampler(model, tokenizer_oadm, alphabet)
+            sequences = list()
+            ref_sequences = list(dataset.train) + list(
+                dataset.valid
+            )  # So we don't regenerate smth that's already in
+            # generate new sequences
+            while len(sequences) < args.n_queries:  # n_queries is K
+                # This method sequentially runs targeted masking, then SMC
+                sampler.generate_raa_from_alanine_scan(
+                    proxy,
+                    starting_sequence,
+                    args.batch_size,
+                    args.resampling_steps,
+                    args.min_corruptions,
+                    args.max_corruptions,
+                    args.kappa_scan,
+                    args.n_checks_multiplier,
+                    args.kappa_guidance,
+                )
+                # This method is inherited from parent Sampler class
+                sequences += sampler.get_top_sequences(args.n_queries, ref_sequences)
+                ref_sequences += sequences  # add sequences to those we've already seen
+
+            sequences = sequences[: args.n_queries]
+            assert len(sequences) == args.n_queries
+
+            # eval candidate sequences
+            if not args.task.startswith("D_SHIFT"):
+                scores = oracle.get_fitness(np.array(sequences)).tolist()
+            else:
+                scores = oracle.get_fitness(sequences).tolist()
+
+            # append dataset and retrain the surrogate
+            dataset.add((sequences, scores))
+            exp_tracker.calculate_top_n_metrics((sequences, scores), e + 1, n=100)
+            starting_sequence = (
+                get_new_starting_seq(dataset)
+                if not args.task.startswith("D_SHIFT")
+                else get_new_starting_seq_dshift(dataset, args.task)
+            )
+
+            proxy = Ensemble(
+                [
+                    build_surrogate_model(
+                        len(wt_sequence),
+                        args,
+                        shared_esm_components=shared_esm_components,
+                    )
+                    for _ in range(args.ensemble_size)
+                ]
+            )
+            exp_tracker.save_results(save_path)
+            if e + 1 < args.n_iters:
+                proxy.train(dataset)
+    finally:
+        if run_cache_temp_dir is not None:
+            run_cache_temp_dir.cleanup()
 
 
 def main():
