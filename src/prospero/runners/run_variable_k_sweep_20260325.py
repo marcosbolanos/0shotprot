@@ -68,6 +68,7 @@ def main():
     parser.add_argument("--min-corruptions", type=int, default=3)
     parser.add_argument("--max-corruptions", type=int, default=10)
     parser.add_argument("--max-workers", type=int, default=5)
+    parser.add_argument("--disable-esm-cache", action="store_true", default=False)
     parser.add_argument("--n-queries-base", type=int, default=None)
     parser.add_argument("--uv-cache-dir", default=None)
     args = parser.parse_args()
@@ -102,6 +103,8 @@ def main():
         ]
         if args.n_queries_base is not None:
             command.extend(["--n-queries-base", str(args.n_queries_base)])
+        if args.disable_esm_cache:
+            command.append("--disable-esm-cache")
         if args.uv_cache_dir is not None:
             command.extend(["--uv-cache-dir", args.uv_cache_dir])
         command.extend(experiment["extra_args"])

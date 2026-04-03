@@ -5,19 +5,14 @@ import concurrent.futures
 import os
 import subprocess
 import sys
+import threading
+import traceback
+from dataclasses import dataclass
 from copy import deepcopy
 from pathlib import Path
 from typing import Optional, Sequence, TextIO
 
 from tqdm import tqdm
-
-from prospero.runners.run_protein import (
-    FROZEN_ESM_SURROGATE_ARCHS,
-    get_parser as get_protein_parser,
-    logger as protein_logger,
-    run_iter as run_protein_iter,
-)
-from prospero.surrogate import prepare_shared_esm_components
 
 
 class TeeStream:
@@ -41,6 +36,14 @@ class TeeStream:
         )
 
 
+@dataclass(frozen=True)
+class SharedESMComponents:
+    tokenizer: object
+    esm: object
+    esm_forward_lock: object | None = None
+    esm_batch_worker: object | None = None
+
+
 def parse_int_list(value: str) -> list[int]:
     try:
         return [int(item) for item in value.split(",") if item]
@@ -52,6 +55,8 @@ def _run_command(process_args: Sequence[str], env: Optional[dict[str, str]]) -> 
     run_env = dict(env) if env is not None else os.environ.copy()
     # Encourage child Python processes to flush output promptly.
     run_env.setdefault("PYTHONUNBUFFERED", "1")
+    run_env.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    print(f"[driver] launching: {' '.join(process_args)}", flush=True)
 
     with subprocess.Popen(
         process_args,
@@ -74,6 +79,51 @@ def run_seed(process_args: Sequence[str], env: dict[str, str]) -> None:
     _run_command(process_args, env)
 
 
+def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponents:
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    from prospero.surrogate import SharedESMBatchWorker
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("[shared-esm] loading tokenizer from local cache", flush=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.esm_model_name,
+            local_files_only=True,
+        )
+    except Exception:
+        print("[shared-esm] local tokenizer cache miss, falling back to hub", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.esm_model_name)
+
+    print("[shared-esm] loading model from local cache", flush=True)
+    try:
+        esm = AutoModel.from_pretrained(
+            args.esm_model_name,
+            local_files_only=True,
+        ).to(device)
+    except Exception:
+        print("[shared-esm] local model cache miss, falling back to hub", flush=True)
+        esm = AutoModel.from_pretrained(args.esm_model_name).to(device)
+
+    print(f"[shared-esm] shared ESM model loaded on {device}", flush=True)
+    esm.eval()
+    for param in esm.parameters():
+        param.requires_grad = False
+    esm_batch_worker = SharedESMBatchWorker(
+        tokenizer=tokenizer,
+        esm=esm,
+        device=device,
+        max_batch_sequences=512,
+        max_wait_ms=4.0,
+    )
+    return SharedESMComponents(
+        tokenizer=tokenizer,
+        esm=esm,
+        esm_forward_lock=None,
+        esm_batch_worker=esm_batch_worker,
+    )
+
+
 def _build_protein_args(
     runner_args: argparse.Namespace,
     batch_dir: Path,
@@ -81,6 +131,8 @@ def _build_protein_args(
     n_queries: int,
     seed: int,
 ) -> argparse.Namespace:
+    from prospero.runners.run_protein import get_parser as get_protein_parser
+
     protein_args = get_protein_parser().parse_args([])
     protein_args.task = runner_args.task
     protein_args.results_dirpath = str(batch_dir)
@@ -106,10 +158,32 @@ def _run_seed_in_process(
     protein_args: argparse.Namespace,
     shared_esm_components,
 ) -> None:
-    run_protein_iter(protein_args, protein_logger, shared_esm_components)
+    from prospero.runners.run_protein import (
+        logger as protein_logger,
+        run_iter as run_protein_iter,
+    )
+
+    print(f"[shared-esm] starting seed {protein_args.seed}", flush=True)
+    try:
+        run_protein_iter(protein_args, protein_logger, shared_esm_components)
+    except Exception:
+        print(
+            f"[shared-esm] seed {protein_args.seed} raised an exception",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc()
+        raise
+    print(f"[shared-esm] finished seed {protein_args.seed}", flush=True)
 
 
 def main() -> None:
+    frozen_esm_surrogate_archs = {
+        "frozen_esm_mlp",
+        "frozen_esm_cnn",
+        "frozen_esm_flat_linear",
+        "frozen_esm_flat_ridge",
+    }
     parser = argparse.ArgumentParser(
         description="Run variable-n_queries seeds with a shared Python driver."
     )
@@ -166,6 +240,12 @@ def main() -> None:
             seeds = parse_int_list(args.seeds)
             max_workers = max(1, args.max_workers)
             n_iters = args.n_iters
+            share_frozen_esm = args.surrogate_arch in frozen_esm_surrogate_archs
+            if share_frozen_esm:
+                print(
+                    f"[shared-esm] enabled by default for {args.surrogate_arch}",
+                    flush=True,
+                )
 
             total_runs = len(n_samples_values) * len(seeds)
             with tqdm(
@@ -225,14 +305,21 @@ def main() -> None:
 
                     errors: list[tuple[Sequence[str], Exception]] = []
                     seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=max_workers
-                    ) as executor:
-                        future_to_cmd = {}
-                        if args.surrogate_arch in FROZEN_ESM_SURROGATE_ARCHS:
+                    if share_frozen_esm:
+                        executor_workers = max_workers
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=executor_workers
+                        ) as executor:
+                            future_to_cmd = {}
+                            shared_esm_components = None
                             if args.uv_cache_dir:
                                 os.environ["UV_CACHE_DIR"] = args.uv_cache_dir
+                            print(
+                                f"[shared-esm] preparing shared ESM for {args.surrogate_arch}",
+                                flush=True,
+                            )
                             shared_esm_components = prepare_shared_esm_components(args)
+                            print("[shared-esm] shared ESM ready", flush=True)
                             for seed in seeds:
                                 protein_args = _build_protein_args(
                                     runner_args=args,
@@ -240,6 +327,10 @@ def main() -> None:
                                     n_iters=n_iters,
                                     n_queries=n_queries,
                                     seed=seed,
+                                )
+                                print(
+                                    f"[shared-esm] submitting seed {seed}",
+                                    flush=True,
                                 )
                                 future = executor.submit(
                                     _run_seed_in_process,
@@ -249,21 +340,43 @@ def main() -> None:
                                 future_to_cmd[future] = (
                                     f"in-process run_protein seed={seed}",
                                 )
-                        else:
+                            try:
+                                for future in concurrent.futures.as_completed(future_to_cmd):
+                                    cmd = future_to_cmd[future]
+                                    try:
+                                        future.result()
+                                    except (
+                                        Exception
+                                    ) as exc:  # include subprocess.CalledProcessError
+                                        errors.append((cmd, exc))
+                                    finally:
+                                        progress.update(1)
+                            finally:
+                                if (
+                                    shared_esm_components is not None
+                                    and shared_esm_components.esm_batch_worker is not None
+                                ):
+                                    shared_esm_components.esm_batch_worker.close()
+                    else:
+                        executor_workers = max_workers
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=executor_workers
+                        ) as executor:
+                            future_to_cmd = {}
                             future_to_cmd = {
                                 executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
                                 for cmd in seed_cmds
                             }
-                        for future in concurrent.futures.as_completed(future_to_cmd):
-                            cmd = future_to_cmd[future]
-                            try:
-                                future.result()
-                            except (
-                                Exception
-                            ) as exc:  # include subprocess.CalledProcessError
-                                errors.append((cmd, exc))
-                            finally:
-                                progress.update(1)
+                            for future in concurrent.futures.as_completed(future_to_cmd):
+                                cmd = future_to_cmd[future]
+                                try:
+                                    future.result()
+                                except (
+                                    Exception
+                                ) as exc:  # include subprocess.CalledProcessError
+                                    errors.append((cmd, exc))
+                                finally:
+                                    progress.update(1)
 
                     if errors:
                         for cmd, exc in errors:
