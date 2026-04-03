@@ -201,6 +201,7 @@ def build_feature_matrix(
     embeddings = residue_embeddings.detach().cpu().numpy().astype(np.float32, copy=False)
     if feature_name in {
         "one_hot_flat",
+        "flatten_plus_one_hot",
         "mean_pool_plus_one_hot",
         "mean_pool_l2_plus_one_hot",
         "mean_pool_zscore_plus_one_hot",
@@ -209,6 +210,11 @@ def build_feature_matrix(
 
     if feature_name == "one_hot_flat":
         return sequences_to_one_hot_flat(sequences or [])
+
+    if feature_name == "flatten_plus_one_hot":
+        flatten = embeddings.reshape(embeddings.shape[0], -1)
+        one_hot = sequences_to_one_hot_flat(sequences or [])
+        return np.concatenate([flatten, one_hot], axis=1)
 
     if feature_name == "mean_pool":
         return embeddings.mean(axis=1)
