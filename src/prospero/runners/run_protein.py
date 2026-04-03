@@ -102,6 +102,12 @@ def get_parser():
         help="Optional max tokenized sequence length for ESM inputs",
     )
     parser.add_argument(
+        "--esm-run-cache-base-dir",
+        type=str,
+        default="/home/lamsade/mbolanos/tmp",
+        help="Base directory for per-seed temporary ESM run cache directories.",
+    )
+    parser.add_argument(
         "--ridge_alpha",
         type=float,
         default=1.0,
@@ -139,9 +145,13 @@ def run_iter(args, logger, shared_esm_components=None):
             normalize_sequences(list(dataset.train) + list(dataset.valid))
         )
         args.cache_allowed_sequences = initial_dataset_sequences
+        run_cache_base_dir = getattr(
+            args, "esm_run_cache_base_dir", "/home/lamsade/mbolanos/tmp"
+        )
+        os.makedirs(run_cache_base_dir, exist_ok=True)
         run_cache_temp_dir = tempfile.TemporaryDirectory(
             prefix=f"prospero_esm_run_seed_{seed}_",
-            dir="/tmp",
+            dir=run_cache_base_dir,
         )
         args.esm_run_cache_root = run_cache_temp_dir.name
 

@@ -2,6 +2,7 @@
 
 import argparse
 import concurrent.futures
+from datetime import datetime
 import os
 import subprocess
 import sys
@@ -42,6 +43,7 @@ class SharedESMComponents:
     esm: object
     esm_forward_lock: object | None = None
     esm_batch_worker: object | None = None
+    esm_in_memory_cache_pool: object | None = None
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -82,7 +84,7 @@ def run_seed(process_args: Sequence[str], env: dict[str, str]) -> None:
 def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponents:
     import torch
     from transformers import AutoModel, AutoTokenizer
-    from prospero.surrogate import SharedESMBatchWorker
+    from prospero.surrogate import SharedESMBatchWorker, SharedInMemoryESMCachePool
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[shared-esm] loading tokenizer from local cache", flush=True)
@@ -116,11 +118,13 @@ def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponen
         max_batch_sequences=512,
         max_wait_ms=4.0,
     )
+    esm_in_memory_cache_pool = SharedInMemoryESMCachePool(storage_dtype=torch.float16)
     return SharedESMComponents(
         tokenizer=tokenizer,
         esm=esm,
         esm_forward_lock=None,
         esm_batch_worker=esm_batch_worker,
+        esm_in_memory_cache_pool=esm_in_memory_cache_pool,
     )
 
 
@@ -148,6 +152,7 @@ def _build_protein_args(
     protein_args.esm_cnn_concat_one_hot = runner_args.esm_cnn_concat_one_hot
     protein_args.esm_model_name = runner_args.esm_model_name
     protein_args.esm_max_length = runner_args.esm_max_length
+    protein_args.esm_run_cache_base_dir = runner_args.esm_run_cache_base_dir
     protein_args.ridge_alpha = runner_args.ridge_alpha
     protein_args.ridge_fit_intercept = runner_args.ridge_fit_intercept
     protein_args.disable_esm_cache = runner_args.disable_esm_cache
@@ -221,6 +226,10 @@ def main() -> None:
     parser.add_argument("--min-corruptions", type=int, default=3)
     parser.add_argument("--max-corruptions", type=int, default=10)
     parser.add_argument("--max-workers", type=int, default=5)
+    parser.add_argument(
+        "--esm-run-cache-base-dir",
+        default="/home/lamsade/mbolanos/tmp",
+    )
     parser.add_argument("--n-queries-base", type=int, default=None)
     parser.add_argument("--uv-cache-dir", default=os.environ.get("UV_CACHE_DIR"))
     args = parser.parse_args()
@@ -240,12 +249,21 @@ def main() -> None:
             seeds = parse_int_list(args.seeds)
             max_workers = max(1, args.max_workers)
             n_iters = args.n_iters
+            run_cache_scope = (
+                Path(args.esm_run_cache_base_dir)
+                / f"run_variable_k_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+            )
+            run_cache_scope.mkdir(parents=True, exist_ok=True)
             share_frozen_esm = args.surrogate_arch in frozen_esm_surrogate_archs
             if share_frozen_esm:
                 print(
                     f"[shared-esm] enabled by default for {args.surrogate_arch}",
                     flush=True,
                 )
+            print(
+                f"[shared-esm] run cache scope: {run_cache_scope}",
+                flush=True,
+            )
 
             total_runs = len(n_samples_values) * len(seeds)
             with tqdm(
@@ -287,6 +305,9 @@ def main() -> None:
                         cmd_template.append("--esm_cnn_use_layernorm")
                     if args.esm_cnn_concat_one_hot:
                         cmd_template.append("--esm_cnn_concat_one_hot")
+                    cmd_template.extend(
+                        ["--esm-run-cache-base-dir", str(run_cache_scope)]
+                    )
                     n_queries = (
                         args.n_queries_base
                         if args.n_queries_base is not None

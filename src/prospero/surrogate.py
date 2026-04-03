@@ -35,6 +35,59 @@ class _ESMBatchRequest:
     future: Future
 
 
+class InMemoryESMEmbeddingCache:
+    """Thread-safe RAM-only embedding cache with get_many/set_many API."""
+
+    def __init__(self, storage_dtype=torch.float16):
+        self.storage_dtype = storage_dtype
+        self._store = {}
+        self._lock = threading.Lock()
+
+    def get_many(self, sequences):
+        embeddings_by_sequence = {}
+        missing_sequences = []
+        with self._lock:
+            for sequence in sequences:
+                embedding = self._store.get(sequence)
+                if embedding is None:
+                    missing_sequences.append(sequence)
+                    continue
+                embeddings_by_sequence[sequence] = embedding
+        return embeddings_by_sequence, missing_sequences
+
+    def set_many(self, sequences, embeddings):
+        with self._lock:
+            for sequence, embedding in zip(sequences, embeddings):
+                if sequence in self._store:
+                    continue
+                self._store[sequence] = (
+                    embedding.detach().cpu().to(self.storage_dtype).to(torch.float32)
+                )
+
+
+class SharedInMemoryESMCachePool:
+    """Provides shared persistent/run-scoped RAM caches across workers/models."""
+
+    def __init__(self, storage_dtype=torch.float16):
+        self.storage_dtype = storage_dtype
+        self._caches = {}
+        self._lock = threading.Lock()
+
+    def get_cache(self, model_name, max_length, representation_name, scope):
+        key = (
+            str(model_name),
+            str(max_length),
+            str(representation_name),
+            str(scope),
+        )
+        with self._lock:
+            cache = self._caches.get(key)
+            if cache is None:
+                cache = InMemoryESMEmbeddingCache(storage_dtype=self.storage_dtype)
+                self._caches[key] = cache
+            return cache
+
+
 class SharedESMBatchWorker:
     def __init__(
         self,
@@ -549,6 +602,7 @@ class FrozenESMModel:
         self.max_length = args.esm_max_length
         self.esm_forward_lock = getattr(args, "esm_forward_lock", None)
         self.esm_batch_worker = getattr(args, "esm_batch_worker", None)
+        self.esm_in_memory_cache_pool = getattr(args, "esm_in_memory_cache_pool", None)
         from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
@@ -559,26 +613,42 @@ class FrozenESMModel:
 
         embedding_dim = self.esm.config.hidden_size
         self.embedding_dim = embedding_dim
-        self.persistent_embedding_cache = ESMEmbeddingFileCache(
-            model_name=model_name,
-            max_length=self.max_length,
-            representation_name=representation_name,
-            cache_root=get_esm_embedding_cache_path(),
-            max_disk_bytes=0,
-            max_memory_bytes=512 * 1024 * 1024,
-            storage_dtype="float16",
-            eviction_check_interval=256,
-        )
-        self.run_embedding_cache = ESMEmbeddingFileCache(
-            model_name=model_name,
-            max_length=self.max_length,
-            representation_name=representation_name,
-            cache_root=getattr(args, "esm_run_cache_root", get_esm_embedding_cache_path()),
-            max_disk_bytes=0,
-            max_memory_bytes=512 * 1024 * 1024,
-            storage_dtype="float16",
-            eviction_check_interval=256,
-        )
+        if self.esm_in_memory_cache_pool is not None:
+            self.persistent_embedding_cache = self.esm_in_memory_cache_pool.get_cache(
+                model_name=model_name,
+                max_length=self.max_length,
+                representation_name=representation_name,
+                scope="persistent",
+            )
+            self.run_embedding_cache = self.esm_in_memory_cache_pool.get_cache(
+                model_name=model_name,
+                max_length=self.max_length,
+                representation_name=representation_name,
+                scope="run_scoped",
+            )
+        else:
+            self.persistent_embedding_cache = ESMEmbeddingFileCache(
+                model_name=model_name,
+                max_length=self.max_length,
+                representation_name=representation_name,
+                cache_root=get_esm_embedding_cache_path(),
+                max_disk_bytes=0,
+                max_memory_bytes=512 * 1024 * 1024,
+                storage_dtype="float16",
+                eviction_check_interval=256,
+            )
+            self.run_embedding_cache = ESMEmbeddingFileCache(
+                model_name=model_name,
+                max_length=self.max_length,
+                representation_name=representation_name,
+                cache_root=getattr(
+                    args, "esm_run_cache_root", get_esm_embedding_cache_path()
+                ),
+                max_disk_bytes=0,
+                max_memory_bytes=512 * 1024 * 1024,
+                storage_dtype="float16",
+                eviction_check_interval=256,
+            )
         self.cache_enabled = not getattr(args, "disable_esm_cache", False)
         self.cache_allowed_sequences = (
             set(cache_allowed_sequences) if cache_allowed_sequences is not None else set()
@@ -1041,16 +1111,21 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
         esm = None
         esm_forward_lock = None
         esm_batch_worker = None
+        esm_in_memory_cache_pool = None
         if shared_esm_components is not None:
             if hasattr(shared_esm_components, "tokenizer"):
                 tokenizer = shared_esm_components.tokenizer
                 esm = shared_esm_components.esm
                 esm_forward_lock = getattr(shared_esm_components, "esm_forward_lock", None)
                 esm_batch_worker = getattr(shared_esm_components, "esm_batch_worker", None)
+                esm_in_memory_cache_pool = getattr(
+                    shared_esm_components, "esm_in_memory_cache_pool", None
+                )
             elif isinstance(shared_esm_components, tuple):
                 tokenizer, esm = shared_esm_components
         args.esm_forward_lock = esm_forward_lock
         args.esm_batch_worker = esm_batch_worker
+        args.esm_in_memory_cache_pool = esm_in_memory_cache_pool
         if args.surrogate_arch == "frozen_esm_mlp":
             return FrozenESMMeanPooledModel(
                 args,
@@ -1092,6 +1167,7 @@ class SharedESMComponents:
     esm: object
     esm_forward_lock: object | None = None
     esm_batch_worker: SharedESMBatchWorker | None = None
+    esm_in_memory_cache_pool: SharedInMemoryESMCachePool | None = None
 
 
 def prepare_shared_esm_components(args):
@@ -1129,9 +1205,11 @@ def prepare_shared_esm_components(args):
         max_batch_sequences=getattr(args, "shared_esm_max_batch_sequences", 512),
         max_wait_ms=getattr(args, "shared_esm_max_wait_ms", 4.0),
     )
+    esm_in_memory_cache_pool = SharedInMemoryESMCachePool(storage_dtype=torch.float16)
     return SharedESMComponents(
         tokenizer=tokenizer,
         esm=esm,
         esm_forward_lock=None,
         esm_batch_worker=esm_batch_worker,
+        esm_in_memory_cache_pool=esm_in_memory_cache_pool,
     )
