@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from copy import deepcopy
@@ -81,6 +82,32 @@ def run_seed(process_args: Sequence[str], env: dict[str, str]) -> None:
     _run_command(process_args, env)
 
 
+def _run_seed_with_retries(
+    process_args: Sequence[str],
+    env: dict[str, str],
+    *,
+    safe: bool,
+    max_seed_retries: int,
+    retry_backoff_seconds: float,
+) -> None:
+    total_attempts = 1 + (max_seed_retries if safe else 0)
+    for attempt in range(1, total_attempts + 1):
+        try:
+            run_seed(process_args, env)
+            return
+        except Exception:
+            if attempt >= total_attempts:
+                raise
+            wait_seconds = retry_backoff_seconds * attempt
+            print(
+                f"[safe] seed command failed (attempt {attempt}/{total_attempts}), "
+                f"retrying in {wait_seconds:.1f}s: {' '.join(process_args)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(wait_seconds)
+
+
 def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponents:
     import torch
     from transformers import AutoModel, AutoTokenizer
@@ -141,6 +168,7 @@ def _build_protein_args(
     protein_args.task = runner_args.task
     protein_args.results_dirpath = str(batch_dir)
     protein_args.n_iters = n_iters
+    protein_args.alphabet = runner_args.alphabet
     protein_args.min_corruptions = runner_args.min_corruptions
     protein_args.max_corruptions = runner_args.max_corruptions
     protein_args.surrogate_arch = runner_args.surrogate_arch
@@ -182,27 +210,66 @@ def _run_seed_in_process(
     print(f"[shared-esm] finished seed {protein_args.seed}", flush=True)
 
 
+def _run_seed_in_process_with_retries(
+    protein_args: argparse.Namespace,
+    shared_esm_components,
+    *,
+    safe: bool,
+    max_seed_retries: int,
+    retry_backoff_seconds: float,
+) -> None:
+    total_attempts = 1 + (max_seed_retries if safe else 0)
+    for attempt in range(1, total_attempts + 1):
+        try:
+            _run_seed_in_process(protein_args, shared_esm_components)
+            return
+        except Exception:
+            if attempt >= total_attempts:
+                raise
+            # Best-effort cleanup before retrying after a failure.
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            wait_seconds = retry_backoff_seconds * attempt
+            print(
+                f"[safe] in-process seed {protein_args.seed} failed "
+                f"(attempt {attempt}/{total_attempts}), retrying in "
+                f"{wait_seconds:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(wait_seconds)
+
+
 def main() -> None:
     frozen_esm_surrogate_archs = {
         "frozen_esm_mlp",
         "frozen_esm_cnn",
         "frozen_esm_flat_linear",
         "frozen_esm_flat_ridge",
+        "frozen_esm_flat_ridge_no_onehot",
     }
     parser = argparse.ArgumentParser(
         description="Run variable-n_queries seeds with a shared Python driver."
     )
     parser.add_argument("results_dir", type=Path)
     parser.add_argument("--task", default="AAV")
+    parser.add_argument("--alphabet", default="CHARGE")
     parser.add_argument(
         "--surrogate-arch",
         default="cnn",
         choices=(
             "cnn",
+            "one_hot_ridge",
             "frozen_esm_mlp",
             "frozen_esm_cnn",
             "frozen_esm_flat_linear",
             "frozen_esm_flat_ridge",
+            "frozen_esm_flat_ridge_no_onehot",
         ),
     )
     parser.add_argument("--esm-cnn-projection-dim", type=int, default=None)
@@ -226,6 +293,9 @@ def main() -> None:
     parser.add_argument("--min-corruptions", type=int, default=3)
     parser.add_argument("--max-corruptions", type=int, default=10)
     parser.add_argument("--max-workers", type=int, default=5)
+    parser.add_argument("--safe", action="store_true", default=False)
+    parser.add_argument("--max-seed-retries", type=int, default=2)
+    parser.add_argument("--retry-backoff-seconds", type=float, default=5.0)
     parser.add_argument(
         "--esm-run-cache-base-dir",
         default="/home/lamsade/mbolanos/tmp",
@@ -260,6 +330,12 @@ def main() -> None:
                     f"[shared-esm] enabled by default for {args.surrogate_arch}",
                     flush=True,
                 )
+            if args.safe:
+                print(
+                    "[safe] enabled: failed seeds will be retried "
+                    f"up to {args.max_seed_retries} times",
+                    flush=True,
+                )
             print(
                 f"[shared-esm] run cache scope: {run_cache_scope}",
                 flush=True,
@@ -282,6 +358,8 @@ def main() -> None:
                         "src/prospero/runners/run_protein.py",
                         "--task",
                         args.task,
+                        "--alphabet",
+                        args.alphabet,
                         "--results_dirpath",
                         str(batch_dir),
                         "--n_iters",
@@ -354,9 +432,12 @@ def main() -> None:
                                     flush=True,
                                 )
                                 future = executor.submit(
-                                    _run_seed_in_process,
+                                    _run_seed_in_process_with_retries,
                                     deepcopy(protein_args),
                                     shared_esm_components,
+                                    safe=args.safe,
+                                    max_seed_retries=args.max_seed_retries,
+                                    retry_backoff_seconds=args.retry_backoff_seconds,
                                 )
                                 future_to_cmd[future] = (
                                     f"in-process run_protein seed={seed}",
@@ -385,7 +466,14 @@ def main() -> None:
                         ) as executor:
                             future_to_cmd = {}
                             future_to_cmd = {
-                                executor.submit(run_seed, tuple(cmd), env): tuple(cmd)
+                                executor.submit(
+                                    _run_seed_with_retries,
+                                    tuple(cmd),
+                                    env,
+                                    safe=args.safe,
+                                    max_seed_retries=args.max_seed_retries,
+                                    retry_backoff_seconds=args.retry_backoff_seconds,
+                                ): tuple(cmd)
                                 for cmd in seed_cmds
                             }
                             for future in concurrent.futures.as_completed(future_to_cmd):

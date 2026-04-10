@@ -38,6 +38,7 @@ FROZEN_ESM_SURROGATE_ARCHS = {
     "frozen_esm_cnn",
     "frozen_esm_flat_linear",
     "frozen_esm_flat_ridge",
+    "frozen_esm_flat_ridge_no_onehot",
 }
 
 
@@ -78,10 +79,12 @@ def get_parser():
         type=str,
         choices=[
             "cnn",
+            "one_hot_ridge",
             "frozen_esm_mlp",
             "frozen_esm_cnn",
             "frozen_esm_flat_linear",
             "frozen_esm_flat_ridge",
+            "frozen_esm_flat_ridge_no_onehot",
         ],
         default="cnn",
     )

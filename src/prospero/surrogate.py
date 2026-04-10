@@ -998,6 +998,7 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
         seq_length,
         args,
         regression_type,
+        include_one_hot=True,
         tokenizer=None,
         esm=None,
         **kwargs,
@@ -1005,6 +1006,7 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
         self.seq_length = seq_length
         self.alphabet = "ACDEFGHIKLMNPQRSTVWY"
         self.regression_type = regression_type
+        self.include_one_hot = include_one_hot
         super().__init__(
             args,
             build_net=None,
@@ -1065,6 +1067,9 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
             .numpy()
             .astype(np.float32, copy=False)
         )
+        if not self.include_one_hot:
+            return flattened_embeddings
+
         one_hots = sequences_to_tensor(sequences, self.alphabet)
         flattened_one_hots = (
             torch.permute(one_hots, [0, 2, 1])
@@ -1100,12 +1105,70 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
         return torch.from_numpy(predictions).to(self.device)
 
 
+class OneHotSklearnModel:
+    def __init__(self, seq_length, args, regression_type):
+        self.seq_length = seq_length
+        self.args = args
+        self.regression_type = regression_type
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.alphabet = "ACDEFGHIKLMNPQRSTVWY"
+        self.scaler = StandardScaler()
+        if regression_type == "ridge":
+            self.regressor = Ridge(
+                alpha=args.ridge_alpha,
+                fit_intercept=args.ridge_fit_intercept,
+            )
+        elif regression_type == "linear":
+            self.regressor = LinearRegression(
+                fit_intercept=args.ridge_fit_intercept
+            )
+        else:
+            raise ValueError(f"Unsupported regression_type={regression_type}")
+        self._is_fitted = False
+
+    def _build_features(self, sequences):
+        one_hots = sequences_to_tensor(sequences, self.alphabet)
+        return (
+            torch.permute(one_hots, [0, 2, 1])
+            .contiguous()
+            .reshape(one_hots.shape[0], -1)
+            .cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+
+    def train(self, dataset):
+        train_sequences = normalize_sequences(dataset.train)
+        train_features = self._build_features(train_sequences)
+        train_labels = np.asarray(dataset.train_scores, dtype=np.float32)
+        scaled_train_features = self.scaler.fit_transform(train_features)
+        self.regressor.fit(scaled_train_features, train_labels)
+        self._is_fitted = True
+
+    def get_fitness(self, sequences):
+        if not self._is_fitted:
+            raise RuntimeError("Regressor has not been fitted. Call train() first.")
+        normalized_sequences = normalize_sequences(sequences)
+        features = self._build_features(normalized_sequences)
+        scaled_features = self.scaler.transform(features)
+        predictions = self.regressor.predict(scaled_features).astype(np.float32)
+        return torch.from_numpy(predictions).to(self.device)
+
+
 def build_surrogate_model(seq_length, args, shared_esm_components=None):
+    if args.surrogate_arch == "one_hot_ridge":
+        return OneHotSklearnModel(
+            seq_length,
+            args,
+            regression_type="ridge",
+        )
+
     if args.surrogate_arch in {
         "frozen_esm_mlp",
         "frozen_esm_cnn",
         "frozen_esm_flat_linear",
         "frozen_esm_flat_ridge",
+        "frozen_esm_flat_ridge_no_onehot",
     }:
         tokenizer = None
         esm = None
@@ -1147,6 +1210,17 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
                 seq_length,
                 args,
                 regression_type="ridge",
+                include_one_hot=True,
+                tokenizer=tokenizer,
+                esm=esm,
+                cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
+            )
+        if args.surrogate_arch == "frozen_esm_flat_ridge_no_onehot":
+            return FrozenESMFlattenedOneHotSklearnModel(
+                seq_length,
+                args,
+                regression_type="ridge",
+                include_one_hot=False,
                 tokenizer=tokenizer,
                 esm=esm,
                 cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
