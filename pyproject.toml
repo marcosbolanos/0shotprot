@@ -15,7 +15,7 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "setuptools<82",
     "tape-proteins",
-    "torch>=2.10.0",
+    "torch==2.5.1",
     "tqdm>=4.67.3",
     "transformers>=5.3.0",
 ]
