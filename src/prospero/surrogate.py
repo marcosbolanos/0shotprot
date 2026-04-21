@@ -64,6 +64,12 @@ class InMemoryESMEmbeddingCache:
                     embedding.detach().cpu().to(self.storage_dtype).to(torch.float32)
                 )
 
+    def clear(self) -> int:
+        with self._lock:
+            cleared = len(self._store)
+            self._store.clear()
+        return cleared
+
 
 class SharedInMemoryESMCachePool:
     """Provides shared persistent/run-scoped RAM caches across workers/models."""
@@ -86,6 +92,16 @@ class SharedInMemoryESMCachePool:
                 cache = InMemoryESMEmbeddingCache(storage_dtype=self.storage_dtype)
                 self._caches[key] = cache
             return cache
+
+    def clear_scope(self, scope) -> int:
+        scope = str(scope)
+        cleared_entries = 0
+        with self._lock:
+            keys_to_delete = [key for key in self._caches if key[3] == scope]
+            for key in keys_to_delete:
+                cleared_entries += self._caches[key].clear()
+                del self._caches[key]
+        return cleared_entries
 
 
 class SharedESMBatchWorker:
@@ -593,6 +609,7 @@ class FrozenESMModel:
         tokenizer=None,
         esm=None,
         cache_allowed_sequences=None,
+        cache_run_sequences=True,
         **kwargs,
     ):
         self.args = args
@@ -603,6 +620,12 @@ class FrozenESMModel:
         self.esm_forward_lock = getattr(args, "esm_forward_lock", None)
         self.esm_batch_worker = getattr(args, "esm_batch_worker", None)
         self.esm_in_memory_cache_pool = getattr(args, "esm_in_memory_cache_pool", None)
+        self.cache_run_sequences = cache_run_sequences
+        self.run_cache_scope = getattr(
+            args,
+            "esm_run_cache_scope",
+            getattr(args, "esm_run_cache_root", "run_scoped"),
+        )
         from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
@@ -620,11 +643,15 @@ class FrozenESMModel:
                 representation_name=representation_name,
                 scope="persistent",
             )
-            self.run_embedding_cache = self.esm_in_memory_cache_pool.get_cache(
-                model_name=model_name,
-                max_length=self.max_length,
-                representation_name=representation_name,
-                scope="run_scoped",
+            self.run_embedding_cache = (
+                self.esm_in_memory_cache_pool.get_cache(
+                    model_name=model_name,
+                    max_length=self.max_length,
+                    representation_name=representation_name,
+                    scope=self.run_cache_scope,
+                )
+                if self.cache_run_sequences
+                else None
             )
         else:
             self.persistent_embedding_cache = ESMEmbeddingFileCache(
@@ -637,17 +664,21 @@ class FrozenESMModel:
                 storage_dtype="float16",
                 eviction_check_interval=256,
             )
-            self.run_embedding_cache = ESMEmbeddingFileCache(
-                model_name=model_name,
-                max_length=self.max_length,
-                representation_name=representation_name,
-                cache_root=getattr(
-                    args, "esm_run_cache_root", get_esm_embedding_cache_path()
-                ),
-                max_disk_bytes=0,
-                max_memory_bytes=512 * 1024 * 1024,
-                storage_dtype="float16",
-                eviction_check_interval=256,
+            self.run_embedding_cache = (
+                ESMEmbeddingFileCache(
+                    model_name=model_name,
+                    max_length=self.max_length,
+                    representation_name=representation_name,
+                    cache_root=getattr(
+                        args, "esm_run_cache_root", get_esm_embedding_cache_path()
+                    ),
+                    max_disk_bytes=0,
+                    max_memory_bytes=512 * 1024 * 1024,
+                    storage_dtype="float16",
+                    eviction_check_interval=256,
+                )
+                if self.cache_run_sequences
+                else None
             )
         self.cache_enabled = not getattr(args, "disable_esm_cache", False)
         self.cache_allowed_sequences = (
@@ -744,16 +775,21 @@ class FrozenESMModel:
                 embeddings_by_sequence[sequence] = embedding
 
         missing_run_sequences = []
-        if run_scoped_sequences:
+        if run_scoped_sequences and self.run_embedding_cache is not None:
             run_embeddings, missing_run_sequences = self.run_embedding_cache.get_many(
                 run_scoped_sequences
             )
             embeddings_by_sequence.update(run_embeddings)
+        elif run_scoped_sequences:
+            missing_run_sequences = list(run_scoped_sequences)
         if missing_run_sequences:
             missing_embeddings = self._compute_sequence_representations(
                 missing_run_sequences
             )
-            self.run_embedding_cache.set_many(missing_run_sequences, missing_embeddings)
+            if self.run_embedding_cache is not None:
+                self.run_embedding_cache.set_many(
+                    missing_run_sequences, missing_embeddings
+                )
             for sequence, embedding in zip(missing_run_sequences, missing_embeddings):
                 embeddings_by_sequence[sequence] = embedding
 
@@ -1001,6 +1037,7 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
         include_one_hot=True,
         tokenizer=None,
         esm=None,
+        cache_run_sequences=True,
         **kwargs,
     ):
         self.seq_length = seq_length
@@ -1013,6 +1050,7 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
             representation_name="per_residue_embeddings_v1",
             tokenizer=tokenizer,
             esm=esm,
+            cache_run_sequences=cache_run_sequences,
             **kwargs,
         )
         self.scaler = StandardScaler()
@@ -1214,6 +1252,7 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
                 tokenizer=tokenizer,
                 esm=esm,
                 cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
+                cache_run_sequences=False,
             )
         if args.surrogate_arch == "frozen_esm_flat_ridge_no_onehot":
             return FrozenESMFlattenedOneHotSklearnModel(
@@ -1224,6 +1263,7 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
                 tokenizer=tokenizer,
                 esm=esm,
                 cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
+                cache_run_sequences=False,
             )
         return FrozenESMPerResidueCNNModel(
             seq_length,
