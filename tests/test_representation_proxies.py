@@ -78,6 +78,30 @@ def test_probe_selection_and_fit_work_on_small_dense_problem():
     assert spearmanr(y, predictions) > 0.9
 
 
+def test_probe_selection_and_fit_work_for_mlp():
+    rng = np.random.RandomState(1)
+    X = rng.normal(size=(36, 8))
+    y = (
+        0.8 * X[:, 0]
+        - 0.6 * X[:, 1]
+        + 0.4 * np.maximum(X[:, 2], 0.0)
+        - 0.2 * np.maximum(-X[:, 3], 0.0)
+        + rng.normal(scale=0.05, size=36)
+    )
+
+    spec = ProbeSpec(
+        name="test_mean_pool_mlp",
+        feature_name="mean_pool",
+        estimator_name="mlp",
+        search_grid=((4,), (8,), (4, 4)),
+    )
+    model, hyperparameter = fit_best_probe(spec, X, y, random_seed=0, scorer=spearmanr)
+    predictions = model.predict(X)
+
+    assert hyperparameter in spec.search_grid
+    assert spearmanr(y, predictions) > 0.5
+
+
 def test_missing_cache_can_be_filled_without_writing_cache(monkeypatch, tmp_path):
     loader = CachedTaskEmbeddingsLoader(
         model_name="fake-esm",
