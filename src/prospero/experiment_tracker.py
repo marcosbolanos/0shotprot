@@ -73,4 +73,9 @@ class ExperimentTracker:
     def save_results(self, path):
         with open(path, "wb") as f:
             pickle.dump(self.exp_results, f)
+
+    def attach_surrogate_artifacts(self, n_iter, artifacts):
+        if n_iter not in self.exp_results:
+            raise KeyError(f"Iteration {n_iter} is missing from exp_results.")
+        self.exp_results[n_iter]["Surrogate"] = artifacts
             

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional, Sequence, TextIO
 
 from tqdm import tqdm
+from prospero.representations.interplm import DEFAULT_INTERPLM_REPO_ID
 
 
 class TeeStream:
@@ -127,6 +128,7 @@ class SharedESMComponents:
     esm_forward_lock: object | None = None
     esm_batch_worker: object | None = None
     esm_in_memory_cache_pool: object | None = None
+    interplm_sae_pool: object | None = None
 
 
 def _seed_result_path(batch_dir: Path, task: str, seed: int) -> Path:
@@ -230,6 +232,7 @@ def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponen
     import torch
     from transformers import AutoModel, AutoTokenizer
     from prospero.surrogate import SharedESMBatchWorker, SharedInMemoryESMCachePool
+    from prospero.representations.interplm import SharedInterPLMSAEPool
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[shared-esm] loading tokenizer from local cache", flush=True)
@@ -256,6 +259,7 @@ def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponen
     esm.eval()
     for param in esm.parameters():
         param.requires_grad = False
+    esm_forward_lock = threading.Lock()
     esm_batch_worker = SharedESMBatchWorker(
         tokenizer=tokenizer,
         esm=esm,
@@ -264,12 +268,14 @@ def prepare_shared_esm_components(args: argparse.Namespace) -> SharedESMComponen
         max_wait_ms=4.0,
     )
     esm_in_memory_cache_pool = SharedInMemoryESMCachePool(storage_dtype=torch.float16)
+    interplm_sae_pool = SharedInterPLMSAEPool()
     return SharedESMComponents(
         tokenizer=tokenizer,
         esm=esm,
-        esm_forward_lock=None,
+        esm_forward_lock=esm_forward_lock,
         esm_batch_worker=esm_batch_worker,
         esm_in_memory_cache_pool=esm_in_memory_cache_pool,
+        interplm_sae_pool=interplm_sae_pool,
     )
 
 
@@ -298,12 +304,24 @@ def _build_protein_args(
     protein_args.esm_cnn_concat_one_hot = runner_args.esm_cnn_concat_one_hot
     protein_args.esm_model_name = runner_args.esm_model_name
     protein_args.esm_max_length = runner_args.esm_max_length
-    protein_args.esm_run_cache_base_dir = runner_args.esm_run_cache_base_dir
     protein_args.ridge_alpha = runner_args.ridge_alpha
     protein_args.ridge_fit_intercept = runner_args.ridge_fit_intercept
+    protein_args.interplm_layer = runner_args.interplm_layer
+    protein_args.interplm_repo_id = runner_args.interplm_repo_id
+    protein_args.interplm_normalized = runner_args.interplm_normalized
+    protein_args.sae_token_chunk_size = runner_args.sae_token_chunk_size
     protein_args.disable_esm_cache = runner_args.disable_esm_cache
     protein_args.debug_events = runner_args.debug_events
     protein_args.debug_heartbeat_seconds = runner_args.debug_heartbeat_seconds
+    ensemble_size = getattr(runner_args, "ensemble_size", None)
+    proxy_batch_size = getattr(runner_args, "proxy_batch_size", None)
+    if ensemble_size is not None:
+        protein_args.ensemble_size = ensemble_size
+    if proxy_batch_size is not None:
+        protein_args.proxy_batch_size = proxy_batch_size
+    if runner_args.surrogate_arch == "interplm_mean_pool_ridge":
+        if ensemble_size is None:
+            protein_args.ensemble_size = 1
     return protein_args
 
 
@@ -367,6 +385,7 @@ def _run_seed_in_process_with_retries(
 
 def main() -> None:
     frozen_esm_surrogate_archs = {
+        "interplm_mean_pool_ridge",
         "frozen_esm_mlp",
         "frozen_esm_cnn",
         "frozen_esm_flat_linear",
@@ -385,6 +404,7 @@ def main() -> None:
         choices=(
             "cnn",
             "one_hot_ridge",
+            "interplm_mean_pool_ridge",
             "frozen_esm_mlp",
             "frozen_esm_cnn",
             "frozen_esm_flat_linear",
@@ -406,6 +426,29 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument("--interplm-layer", type=int, default=2)
+    parser.add_argument(
+        "--interplm-repo-id",
+        default=DEFAULT_INTERPLM_REPO_ID,
+    )
+    parser.add_argument(
+        "--interplm-normalized",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--sae-token-chunk-size", type=int, default=1024)
+    parser.add_argument(
+        "--ensemble-size",
+        type=int,
+        default=None,
+        help="Override surrogate ensemble size. Defaults to 1 for interplm_mean_pool_ridge.",
+    )
+    parser.add_argument(
+        "--proxy-batch-size",
+        type=int,
+        default=None,
+        help="Override proxy batch size.",
+    )
     parser.add_argument("--disable-esm-cache", action="store_true", default=False)
     parser.add_argument("--n-samples", default="8,16,32,64,128")
     parser.add_argument("--seeds", default="1,2,3,4,5")
@@ -419,10 +462,6 @@ def main() -> None:
     parser.add_argument("--retry-backoff-seconds", type=float, default=5.0)
     parser.add_argument("--debug-events", action="store_true", default=False)
     parser.add_argument("--debug-heartbeat-seconds", type=float, default=15.0)
-    parser.add_argument(
-        "--esm-run-cache-base-dir",
-        default="/home/lamsade/mbolanos/tmp",
-    )
     parser.add_argument("--n-queries-base", type=int, default=None)
     parser.add_argument("--uv-cache-dir", default=os.environ.get("UV_CACHE_DIR"))
     args = parser.parse_args()
@@ -495,11 +534,6 @@ def main() -> None:
                     ]
                 else:
                     scheduled_seeds_by_n_samples[n_samples] = list(seeds)
-            run_cache_scope = (
-                Path(args.esm_run_cache_base_dir)
-                / f"run_variable_k_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-            )
-            run_cache_scope.mkdir(parents=True, exist_ok=True)
             share_frozen_esm = args.surrogate_arch in frozen_esm_surrogate_archs
             if share_frozen_esm:
                 print(
@@ -533,15 +567,6 @@ def main() -> None:
                         "resume_missing_seeds_enabled",
                         completed_seeds_by_n_samples=completed_seeds_by_n_samples,
                     )
-            print(
-                f"[shared-esm] run cache scope: {run_cache_scope}",
-                flush=True,
-            )
-            if driver_debug_logger is not None:
-                driver_debug_logger.event(
-                    "run_cache_scope_ready",
-                    run_cache_scope=str(run_cache_scope),
-                )
 
             total_runs = sum(
                 len(scheduled_seeds_by_n_samples[n_samples])
@@ -606,9 +631,6 @@ def main() -> None:
                         cmd_template.append("--esm_cnn_use_layernorm")
                     if args.esm_cnn_concat_one_hot:
                         cmd_template.append("--esm_cnn_concat_one_hot")
-                    cmd_template.extend(
-                        ["--esm-run-cache-base-dir", str(run_cache_scope)]
-                    )
                     n_queries = (
                         args.n_queries_base
                         if args.n_queries_base is not None
@@ -616,6 +638,13 @@ def main() -> None:
                     )
                     cmd_template.extend(["--n_queries", str(n_queries)])
                     cmd_template.extend(["--ridge_alpha", str(args.ridge_alpha)])
+                    cmd_template.extend(["--interplm_layer", str(args.interplm_layer)])
+                    cmd_template.extend(["--interplm_repo_id", args.interplm_repo_id])
+                    if not args.interplm_normalized:
+                        cmd_template.append("--no-interplm_normalized")
+                    cmd_template.extend(
+                        ["--sae_token_chunk_size", str(args.sae_token_chunk_size)]
+                    )
                     if not args.ridge_fit_intercept:
                         cmd_template.append("--no-ridge_fit_intercept")
                     if args.disable_esm_cache:

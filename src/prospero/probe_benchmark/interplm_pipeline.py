@@ -17,7 +17,11 @@ from prospero.experiments_config import WT_SEQUENCES
 from prospero.surrogate import extract_residue_embeddings, normalize_sequences
 
 from .features import sequences_to_one_hot_flat
-from .interplm import DEFAULT_INTERPLM_REPO_ID, load_interplm_sae
+from prospero.representations.interplm import (
+    DEFAULT_INTERPLM_REPO_ID,
+    load_interplm_sae,
+    mean_pool_sae_activations,
+)
 from .metrics import regression_metrics, spearmanr
 from .models import ProbeSpec, extract_linear_probe_parameters, fit_best_probe
 from .plotting import (
@@ -374,22 +378,11 @@ class InterPLMTaskFeatureLoader:
         sae,
         residue_embeddings: torch.Tensor,
     ) -> torch.Tensor:
-        batch_size, sequence_length, hidden_dim = residue_embeddings.shape
-        flattened = residue_embeddings.reshape(batch_size * sequence_length, hidden_dim)
-        pooled = torch.zeros(
-            (batch_size, sae.feature_dim),
-            dtype=torch.float32,
-            device=flattened.device,
+        return mean_pool_sae_activations(
+            sae,
+            residue_embeddings,
+            token_chunk_size=self.sae_token_chunk_size,
         )
-
-        for start in range(0, flattened.shape[0], self.sae_token_chunk_size):
-            stop = min(flattened.shape[0], start + self.sae_token_chunk_size)
-            activations = sae.encode(flattened[start:stop]).to(torch.float32)
-            token_indices = torch.arange(start, stop, device=flattened.device)
-            sequence_indices = token_indices // sequence_length
-            pooled.index_add_(0, sequence_indices, activations)
-
-        return pooled / float(sequence_length)
 
     def _compute_residue_embeddings_by_layer(
         self,

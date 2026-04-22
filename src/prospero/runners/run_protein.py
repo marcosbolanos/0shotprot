@@ -10,6 +10,7 @@ from prospero.experiments_config import ALPHABETS, WT_SEQUENCES
 from prospero.utils import set_seed, get_new_starting_seq, get_new_starting_seq_dshift
 from prospero.experiment_tracker import ExperimentTracker
 from prospero.inference import ProteinSampler
+from prospero.representations.interplm import DEFAULT_INTERPLM_REPO_ID
 
 from prospero.surrogate import (
     Ensemble,
@@ -24,7 +25,6 @@ import argparse
 from argparse import ArgumentDefaultsHelpFormatter
 import numpy as np
 from copy import deepcopy
-import tempfile
 from datetime import datetime, timezone
 
 import logging
@@ -39,12 +39,66 @@ logging.basicConfig(
 
 
 FROZEN_ESM_SURROGATE_ARCHS = {
+    "interplm_mean_pool_ridge",
     "frozen_esm_mlp",
     "frozen_esm_cnn",
     "frozen_esm_flat_linear",
     "frozen_esm_flat_ridge",
     "frozen_esm_flat_ridge_no_onehot",
 }
+
+
+def _extract_surrogate_artifacts(proxy, args):
+    members = []
+    for model_idx, model in enumerate(getattr(proxy, "models", [])):
+        regressor = getattr(model, "regressor", None)
+        if regressor is None or not hasattr(regressor, "coef_"):
+            continue
+
+        coef = np.asarray(regressor.coef_)
+        intercept = np.asarray(getattr(regressor, "intercept_", 0.0))
+        scaler = getattr(model, "scaler", None)
+
+        member_artifact = {
+            "model_index": model_idx,
+            "surrogate_class": type(model).__name__,
+            "regressor_class": type(regressor).__name__,
+            "coef": coef.copy(),
+            "intercept": intercept.copy(),
+        }
+        if hasattr(regressor, "alpha"):
+            member_artifact["alpha"] = float(regressor.alpha)
+        if hasattr(regressor, "fit_intercept"):
+            member_artifact["fit_intercept"] = bool(regressor.fit_intercept)
+        if scaler is not None and hasattr(scaler, "mean_") and hasattr(scaler, "scale_"):
+            member_artifact["scaler_mean"] = np.asarray(scaler.mean_).copy()
+            member_artifact["scaler_scale"] = np.asarray(scaler.scale_).copy()
+        if hasattr(model, "interplm_layer"):
+            member_artifact["interplm_layer"] = int(model.interplm_layer)
+        if hasattr(model, "interplm_repo_id"):
+            member_artifact["interplm_repo_id"] = str(model.interplm_repo_id)
+        if hasattr(model, "interplm_normalized"):
+            member_artifact["interplm_normalized"] = bool(model.interplm_normalized)
+        members.append(member_artifact)
+
+    if not members:
+        return None
+
+    return {
+        "surrogate_arch": args.surrogate_arch,
+        "members": members,
+    }
+
+
+def _dedupe_preserving_order(sequences):
+    seen = set()
+    ordered = []
+    for sequence in sequences:
+        if sequence in seen:
+            continue
+        seen.add(sequence)
+        ordered.append(sequence)
+    return ordered
 
 
 def _json_safe(value):
@@ -213,6 +267,7 @@ def get_parser():
         choices=[
             "cnn",
             "one_hot_ridge",
+            "interplm_mean_pool_ridge",
             "frozen_esm_mlp",
             "frozen_esm_cnn",
             "frozen_esm_flat_linear",
@@ -238,12 +293,6 @@ def get_parser():
         help="Optional max tokenized sequence length for ESM inputs",
     )
     parser.add_argument(
-        "--esm-run-cache-base-dir",
-        type=str,
-        default="/home/lamsade/mbolanos/tmp",
-        help="Base directory for per-seed temporary ESM run cache directories.",
-    )
-    parser.add_argument(
         "--ridge_alpha",
         type=float,
         default=1.0,
@@ -256,6 +305,30 @@ def get_parser():
         help="Whether sklearn linear/ridge surrogate fits an intercept.",
     )
     parser.add_argument("--disable-esm-cache", action="store_true", default=False)
+    parser.add_argument(
+        "--interplm_layer",
+        type=int,
+        default=2,
+        help="ESM hidden layer used to derive mean-pooled InterPLM features.",
+    )
+    parser.add_argument(
+        "--interplm_repo_id",
+        type=str,
+        default=DEFAULT_INTERPLM_REPO_ID,
+        help="Hugging Face repo containing the InterPLM SAE weights.",
+    )
+    parser.add_argument(
+        "--interplm_normalized",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to load normalized InterPLM SAE weights.",
+    )
+    parser.add_argument(
+        "--sae_token_chunk_size",
+        type=int,
+        default=1024,
+        help="Chunk size for pooling SAE activations over residue tokens.",
+    )
     parser.add_argument("--debug-events", action="store_true", default=False)
     parser.add_argument("--debug-heartbeat-seconds", type=float, default=15.0)
 
@@ -266,7 +339,6 @@ def run_iter(args, logger, shared_esm_components=None):
     seed = args.seed
     set_seed(seed, args.full_deterministic)
     logger.info(f"Starting seed {seed}")
-    run_cache_temp_dir = None
 
     save_dir = os.path.join(args.results_dirpath, args.task)
     if not os.path.exists(save_dir):
@@ -306,27 +378,21 @@ def run_iter(args, logger, shared_esm_components=None):
         )
     if args.disable_esm_cache:
         args.cache_allowed_sequences = set()
+        args.cache_allowed_sequences_ordered = []
+        args.dataset_cache_task = None
         if debug_logger is not None:
             debug_logger.event("esm_cache_disabled")
     else:
-        initial_dataset_sequences = set(
+        ordered_initial_dataset_sequences = _dedupe_preserving_order(
             normalize_sequences(list(dataset.train) + list(dataset.valid))
         )
-        args.cache_allowed_sequences = initial_dataset_sequences
-        run_cache_base_dir = getattr(
-            args, "esm_run_cache_base_dir", "/home/lamsade/mbolanos/tmp"
-        )
-        os.makedirs(run_cache_base_dir, exist_ok=True)
-        run_cache_temp_dir = tempfile.TemporaryDirectory(
-            prefix=f"prospero_esm_run_seed_{seed}_",
-            dir=run_cache_base_dir,
-        )
-        args.esm_run_cache_root = run_cache_temp_dir.name
+        args.cache_allowed_sequences = set(ordered_initial_dataset_sequences)
+        args.cache_allowed_sequences_ordered = ordered_initial_dataset_sequences
+        args.dataset_cache_task = args.task
         if debug_logger is not None:
             debug_logger.event(
                 "esm_cache_ready",
-                cache_allowed_sequences=len(initial_dataset_sequences),
-                esm_run_cache_root=args.esm_run_cache_root,
+                cache_allowed_sequences=len(ordered_initial_dataset_sequences),
             )
 
     try:
@@ -462,6 +528,9 @@ def run_iter(args, logger, shared_esm_components=None):
                     dataset_valid_size=len(dataset.valid),
                 )
             exp_tracker.calculate_top_n_metrics((sequences, scores), iteration, n=100)
+            surrogate_artifacts = _extract_surrogate_artifacts(proxy, args)
+            if surrogate_artifacts is not None:
+                exp_tracker.attach_surrogate_artifacts(iteration, surrogate_artifacts)
             starting_sequence = (
                 get_new_starting_seq(dataset)
                 if not args.task.startswith("D_SHIFT")
@@ -520,23 +589,6 @@ def run_iter(args, logger, shared_esm_components=None):
     finally:
         if debug_logger is not None:
             debug_logger.event("seed_cleanup_start")
-        if (
-            shared_esm_components is not None
-            and getattr(shared_esm_components, "esm_in_memory_cache_pool", None)
-            is not None
-            and getattr(args, "esm_run_cache_root", None)
-        ):
-            cleared_entries = shared_esm_components.esm_in_memory_cache_pool.clear_scope(
-                args.esm_run_cache_root
-            )
-            if debug_logger is not None:
-                debug_logger.event(
-                    "seed_run_cache_cleared",
-                    esm_run_cache_root=args.esm_run_cache_root,
-                    cleared_entries=cleared_entries,
-                )
-        if run_cache_temp_dir is not None:
-            run_cache_temp_dir.cleanup()
         if debug_logger is not None:
             debug_logger.event("seed_cleanup_complete")
             debug_logger.stop()
