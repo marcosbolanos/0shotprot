@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gc
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,11 @@ from prospero.utils import set_seed
 class FeatureDirection:
     feature_index: int
     signed_coefficient: float
+    direction_sign: int
+
+
+def _mutation_count(sequence: str, reference: str) -> int:
+    return sum(int(a != b) for a, b in zip(sequence, reference))
 
 
 def _dedupe_preserving_order(items: list[str]) -> list[str]:
@@ -45,6 +51,37 @@ def _dedupe_preserving_order(items: list[str]) -> list[str]:
 
 def _decode_to_sequence(decoded: str) -> str:
     return decoded.replace(" ", "")
+
+
+def _build_rerank_scores(
+    surrogate_scores: np.ndarray,
+    mutation_counts: np.ndarray,
+    mutation_penalty_lambda: float,
+) -> np.ndarray:
+    return surrogate_scores - mutation_penalty_lambda * mutation_counts
+
+
+def _apply_mutation_cap_mask(
+    mutation_counts: np.ndarray,
+    max_mutations: int | None,
+) -> np.ndarray:
+    if max_mutations is None:
+        return np.ones_like(mutation_counts, dtype=bool)
+    return mutation_counts <= float(max_mutations)
+
+
+def _apply_perplexity_cap_mask(
+    mean_masked_ppl: np.ndarray,
+    max_masked_ppl: np.ndarray,
+    max_masked_mean_ppl: float | None,
+    max_masked_token_ppl: float | None,
+) -> np.ndarray:
+    mask = np.ones_like(mean_masked_ppl, dtype=bool)
+    if max_masked_mean_ppl is not None:
+        mask = np.logical_and(mask, mean_masked_ppl <= float(max_masked_mean_ppl))
+    if max_masked_token_ppl is not None:
+        mask = np.logical_and(mask, max_masked_ppl <= float(max_masked_token_ppl))
+    return mask
 
 
 def _prepare_proxy(args, sequence_length: int, dataset: RegressionDataset) -> Ensemble:
@@ -78,7 +115,11 @@ def _prepare_proxy(args, sequence_length: int, dataset: RegressionDataset) -> En
     return proxy
 
 
-def _extract_directions(proxy: Ensemble, top_features: int) -> tuple[torch.Tensor, list[FeatureDirection]]:
+def _extract_directions(
+    proxy: Ensemble,
+    top_features: int,
+    steering_direction_mode: str = "signed",
+) -> tuple[torch.Tensor, list[FeatureDirection]]:
     models = proxy.models
     coef_stack = []
     for model in models:
@@ -95,18 +136,32 @@ def _extract_directions(proxy: Ensemble, top_features: int) -> tuple[torch.Tenso
 
     directions = []
     metadata: list[FeatureDirection] = []
+    if steering_direction_mode not in {"signed", "both", "positive", "negative"}:
+        raise ValueError(
+            "steering_direction_mode must be one of: signed, both, positive, negative"
+        )
     for feature_idx in top_indices.tolist():
         vec = decoder[:, feature_idx]
         vec = vec / vec.norm(p=2)
         signed_coef = float(mean_coef[feature_idx])
-        sign = 1.0 if signed_coef >= 0.0 else -1.0
-        directions.append(vec * sign)
-        metadata.append(
-            FeatureDirection(
-                feature_index=int(feature_idx),
-                signed_coefficient=signed_coef,
+        aligned_sign = 1 if signed_coef >= 0.0 else -1
+        if steering_direction_mode == "signed":
+            signs = [aligned_sign]
+        elif steering_direction_mode == "both":
+            signs = [1, -1]
+        elif steering_direction_mode == "positive":
+            signs = [1]
+        else:
+            signs = [-1]
+        for sign in signs:
+            directions.append(vec * float(sign))
+            metadata.append(
+                FeatureDirection(
+                    feature_index=int(feature_idx),
+                    signed_coefficient=signed_coef,
+                    direction_sign=int(sign),
+                )
             )
-        )
 
     return torch.stack(directions, dim=0), metadata
 
@@ -162,7 +217,11 @@ def run_latent_masked_single_iter(args) -> Path:
     timings["proxy_prepare_and_train_seconds"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    steering_directions, feature_meta = _extract_directions(proxy, args.top_features)
+    steering_directions, feature_meta = _extract_directions(
+        proxy=proxy,
+        top_features=args.top_features,
+        steering_direction_mode=getattr(args, "steering_direction_mode", "signed"),
+    )
     timings["direction_extraction_seconds"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -249,6 +308,7 @@ def run_latent_masked_single_iter(args) -> Path:
                         "sequence": sequence,
                         "feature_index": feature_meta[d_idx].feature_index,
                         "feature_signed_coefficient": feature_meta[d_idx].signed_coefficient,
+                        "steering_direction_sign": feature_meta[d_idx].direction_sign,
                         "steering_scalar": float(s_values[s_idx].item()),
                         "masked_token_positions": positions,
                         "masked_token_perplexities": ppl_values,
@@ -268,10 +328,55 @@ def run_latent_masked_single_iter(args) -> Path:
     t0 = time.perf_counter()
     unique_sequences = list(unique_records_by_sequence.keys())
     surrogate_scores = proxy.get_scores(unique_sequences).detach().cpu().numpy()
-    order = np.argsort(surrogate_scores)[::-1]
+    unique_mut_counts = np.asarray(
+        [_mutation_count(seq, wt_sequence) for seq in unique_sequences], dtype=np.float64
+    )
+    masked_mean_ppl = np.asarray(
+        [
+            float(np.mean(unique_records_by_sequence[seq]["masked_token_perplexities"]))
+            if len(unique_records_by_sequence[seq]["masked_token_perplexities"]) > 0
+            else 0.0
+            for seq in unique_sequences
+        ],
+        dtype=np.float64,
+    )
+    masked_max_ppl = np.asarray(
+        [
+            float(np.max(unique_records_by_sequence[seq]["masked_token_perplexities"]))
+            if len(unique_records_by_sequence[seq]["masked_token_perplexities"]) > 0
+            else 0.0
+            for seq in unique_sequences
+        ],
+        dtype=np.float64,
+    )
+    max_mutations = getattr(args, "max_mutations", None)
+    if max_mutations is not None:
+        max_mutations = int(max_mutations)
+    cap_mask = _apply_mutation_cap_mask(unique_mut_counts, max_mutations)
+    ppl_mask = _apply_perplexity_cap_mask(
+        mean_masked_ppl=masked_mean_ppl,
+        max_masked_ppl=masked_max_ppl,
+        max_masked_mean_ppl=getattr(args, "max_masked_mean_ppl", None),
+        max_masked_token_ppl=getattr(args, "max_masked_token_ppl", None),
+    )
+    cap_mask = np.logical_and(cap_mask, ppl_mask)
+    if bool(np.any(cap_mask)):
+        filtered_indices = np.where(cap_mask)[0]
+        unique_sequences = [unique_sequences[i] for i in filtered_indices.tolist()]
+        surrogate_scores = surrogate_scores[filtered_indices]
+        unique_mut_counts = unique_mut_counts[filtered_indices]
+
+    mutation_penalty_lambda = float(getattr(args, "mutation_penalty_lambda", 0.0))
+    ranking_scores = _build_rerank_scores(
+        surrogate_scores=surrogate_scores,
+        mutation_counts=unique_mut_counts,
+        mutation_penalty_lambda=mutation_penalty_lambda,
+    )
+    order = np.argsort(ranking_scores)[::-1]
     top_indices = order[: args.top_k]
     top_sequences = [unique_sequences[idx] for idx in top_indices]
     top_surrogate_scores = [float(surrogate_scores[idx]) for idx in top_indices]
+    top_ranking_scores = [float(ranking_scores[idx]) for idx in top_indices]
     timings["surrogate_rerank_seconds"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -285,17 +390,29 @@ def run_latent_masked_single_iter(args) -> Path:
 
     t0 = time.perf_counter()
     output_records = []
-    for sequence, surrogate_score, oracle_score in zip(
-        top_sequences, top_surrogate_scores, top_oracle_scores
+    for sequence, surrogate_score, ranking_score, oracle_score in zip(
+        top_sequences, top_surrogate_scores, top_ranking_scores, top_oracle_scores
     ):
         record = dict(unique_records_by_sequence[sequence])
         record["surrogate_score"] = surrogate_score
+        record["ranking_score"] = ranking_score
         record["oracle_score"] = oracle_score
         output_records.append(record)
     timings["output_record_assembly_seconds"] = time.perf_counter() - t0
 
     run_finished_at = datetime.now(timezone.utc).isoformat()
     timings["total_runtime_seconds"] = time.perf_counter() - run_start
+    surrogate_array = np.asarray(top_surrogate_scores, dtype=np.float64)
+    oracle_array = np.asarray(top_oracle_scores, dtype=np.float64)
+    corr = float(np.corrcoef(surrogate_array, oracle_array)[0, 1])
+    if np.isnan(corr):
+        corr = 0.0
+    best_idx = int(np.argmax(oracle_array))
+    mutation_counts = [
+        _mutation_count(str(record["sequence"]), wt_sequence)
+        for record in output_records
+    ]
+
     output = {
         "task": args.task,
         "seed": int(args.seed),
@@ -305,23 +422,90 @@ def run_latent_masked_single_iter(args) -> Path:
         "steering_layer": int(args.steering_layer),
         "top_features": int(args.top_features),
         "steering_scalars": [float(x) for x in args.steering_scalars],
+        "steering_direction_mode": str(
+            getattr(args, "steering_direction_mode", "signed")
+        ),
+        "mutation_penalty_lambda": float(getattr(args, "mutation_penalty_lambda", 0.0)),
+        "max_mutations": (
+            None if getattr(args, "max_mutations", None) is None else int(args.max_mutations)
+        ),
+        "max_masked_mean_ppl": (
+            None
+            if getattr(args, "max_masked_mean_ppl", None) is None
+            else float(args.max_masked_mean_ppl)
+        ),
+        "max_masked_token_ppl": (
+            None
+            if getattr(args, "max_masked_token_ppl", None) is None
+            else float(args.max_masked_token_ppl)
+        ),
         "batch_size": int(args.batch_size),
         "top_k": int(args.top_k),
         "num_generated": int(len(flat_records)),
         "num_unique": int(len(unique_records_by_sequence)),
+        "best_oracle": float(oracle_array[best_idx]),
+        "oracle_top10_mean": float(np.mean(np.sort(oracle_array)[-10:])),
+        "surrogate_oracle_corr": corr,
+        "mean_mutation_count": float(np.mean(mutation_counts) if mutation_counts else 0.0),
+        "best_sequence": str(output_records[best_idx]["sequence"]),
+        "mutated_positions": list(output_records[best_idx]["masked_token_positions"]),
         "timings_seconds": timings,
+        "config_parameters": {
+            "surrogate_arch": args.surrogate_arch,
+            "steering_layer": int(args.steering_layer),
+            "top_features": int(args.top_features),
+            "steering_scalars": [float(x) for x in args.steering_scalars],
+            "steering_direction_mode": str(
+                getattr(args, "steering_direction_mode", "signed")
+            ),
+            "mutation_penalty_lambda": float(
+                getattr(args, "mutation_penalty_lambda", 0.0)
+            ),
+            "max_mutations": (
+                None
+                if getattr(args, "max_mutations", None) is None
+                else int(args.max_mutations)
+            ),
+            "max_masked_mean_ppl": (
+                None
+                if getattr(args, "max_masked_mean_ppl", None) is None
+                else float(args.max_masked_mean_ppl)
+            ),
+            "max_masked_token_ppl": (
+                None
+                if getattr(args, "max_masked_token_ppl", None) is None
+                else float(args.max_masked_token_ppl)
+            ),
+            "combo_chunk_size": int(args.combo_chunk_size),
+            "batch_size": int(args.batch_size),
+            "top_k": int(args.top_k),
+            "min_corruptions": int(args.min_corruptions),
+            "max_corruptions": int(args.max_corruptions),
+            "n_checks_multiplier": int(args.n_checks_multiplier),
+            "kappa_scan": float(args.kappa_scan),
+            "kappa_guidance": float(args.kappa_guidance),
+        },
+        "all_generated_records": flat_records,
         "records": output_records,
     }
 
     timings["output_write_seconds"] = 0.0
     t0 = time.perf_counter()
     output_dir = Path(args.results_dirpath) / args.task
+    phase = getattr(args, "phase", None)
+    if phase is not None:
+        output_dir = output_dir / str(phase)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"seed_{args.seed}_latent_masked_single_iter.json"
     with output_path.open("w", encoding="utf-8") as handle:
         json.dump(output, handle, indent=2)
     timings["output_write_seconds"] = time.perf_counter() - t0
-    with output_path.open("w", encoding="utf-8") as handle:
-        json.dump(output, handle, indent=2)
+
+    del model
+    del oadm_model
+    del proxy
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return output_path

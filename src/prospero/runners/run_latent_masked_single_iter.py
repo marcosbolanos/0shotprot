@@ -14,12 +14,22 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-features", type=int, default=3)
     parser.add_argument("--steering-layer", type=int, default=2)
     parser.add_argument(
+        "--steering-direction-mode",
+        type=str,
+        default="signed",
+        choices=["signed", "both", "positive", "negative"],
+    )
+    parser.add_argument(
         "--steering-scalars",
         type=float,
         nargs="+",
         default=[0.2, 0.7, 1.2, 1.8],
     )
     parser.add_argument("--combo-chunk-size", type=int, default=4)
+    parser.add_argument("--mutation-penalty-lambda", type=float, default=0.0)
+    parser.add_argument("--max-mutations", type=int, default=None)
+    parser.add_argument("--max-masked-mean-ppl", type=float, default=None)
+    parser.add_argument("--max-masked-token-ppl", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=256)
     parser.set_defaults(n_iters=1, surrogate_arch="interplm_mean_pool_ridge")
     return parser
