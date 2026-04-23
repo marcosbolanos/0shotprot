@@ -557,6 +557,47 @@ class ESMMeanPooledRegressor(nn.Module):
         return self.mlp(pooled_sequence_embeddings)
 
 
+class LowRankPositionalRegressor(nn.Module):
+    def __init__(self, seq_length: int, embedding_dim: int, rank: int) -> None:
+        super().__init__()
+        self.seq_length = int(seq_length)
+        self.embedding_dim = int(embedding_dim)
+        self.rank = int(rank)
+        self.position_factors = nn.Parameter(torch.zeros(self.seq_length, self.rank))
+        self.feature_projection = nn.Parameter(
+            torch.randn(self.rank, self.embedding_dim) * 0.02
+        )
+        self.bias = nn.Parameter(torch.zeros(1))
+        self.register_buffer("feature_mean", torch.zeros(self.embedding_dim))
+        self.register_buffer("feature_std", torch.ones(self.embedding_dim))
+
+    @torch.no_grad()
+    def set_feature_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        self.feature_mean.copy_(
+            mean.to(
+                device=self.feature_mean.device,
+                dtype=self.feature_mean.dtype,
+            )
+        )
+        self.feature_std.copy_(
+            torch.clamp(
+                std.to(
+                    device=self.feature_std.device,
+                    dtype=self.feature_std.dtype,
+                ),
+                min=1e-6,
+            )
+        )
+
+    def forward(self, residue_embeddings: torch.Tensor) -> torch.Tensor:
+        mean = self.feature_mean.to(residue_embeddings.dtype)
+        std = self.feature_std.to(residue_embeddings.dtype)
+        normalized = (residue_embeddings - mean[None, None, :]) / std[None, None, :]
+        projected = torch.matmul(normalized, self.feature_projection.t())
+        scores = (projected * self.position_factors[None, :, :]).sum(dim=(1, 2))
+        return (scores + self.bias).unsqueeze(-1)
+
+
 class Ensemble:
     def __init__(self, models):
         self.models = models
@@ -1318,6 +1359,263 @@ class InterPLMMeanPooledSklearnModel(FrozenESMModel):
         return torch.from_numpy(predictions).to(self.device)
 
 
+class InterPLMLowRankPositionalModel(FrozenESMModel):
+    def __init__(
+        self,
+        seq_length,
+        args,
+        tokenizer=None,
+        esm=None,
+        **kwargs,
+    ):
+        self.seq_length = int(seq_length)
+        self.interplm_layer = int(args.interplm_layer)
+        self.interplm_repo_id = str(args.interplm_repo_id)
+        self.interplm_normalized = bool(args.interplm_normalized)
+        self.sae_token_chunk_size = int(
+            getattr(args, "sae_token_chunk_size", 1024)
+        )
+        self.rank = int(getattr(args, "low_rank_positional_rank", 16))
+        self.low_rank_l2 = float(getattr(args, "low_rank_positional_l2", 1e-4))
+        self.low_rank_input = str(
+            getattr(args, "low_rank_positional_input", "sae")
+        ).strip().lower()
+        if self.low_rank_input not in {"esm", "sae", "esm_sae_concat"}:
+            raise ValueError(
+                f"Unsupported low_rank_positional_input={self.low_rank_input!r}. "
+                "Expected one of: esm, sae, esm_sae_concat."
+            )
+        repr_batch_size = getattr(args, "low_rank_positional_repr_batch_size", None)
+        self.representation_batch_size = int(
+            repr_batch_size if repr_batch_size is not None else args.proxy_batch_size
+        )
+        self._sae = None
+        self._feature_stats_ready = False
+        super().__init__(
+            args,
+            build_net=lambda embedding_dim: LowRankPositionalRegressor(
+                seq_length=self.seq_length,
+                embedding_dim=self._resolve_input_dim(embedding_dim),
+                rank=self.rank,
+            ),
+            representation_name=self._representation_name(),
+            tokenizer=tokenizer,
+            esm=esm,
+            enable_dataset_store=False,
+            **kwargs,
+        )
+        # Keep representations on GPU in the hot path; skip RAM cache traffic.
+        self.cache_enabled = False
+        if self.low_rank_input in {"sae", "esm_sae_concat"}:
+            self.representation_batch_size = min(self.representation_batch_size, 16)
+        low_rank_lr = getattr(args, "low_rank_positional_lr", None)
+        self.optimizer = torch.optim.Adam(
+            self.net.parameters(),
+            lr=float(low_rank_lr if low_rank_lr is not None else args.lr),
+            weight_decay=0.0,
+        )
+
+    def _resolve_input_dim(self, embedding_dim):
+        if self.low_rank_input == "esm":
+            return int(embedding_dim)
+        sae = load_interplm_sae(
+            plm_layer=self.interplm_layer,
+            repo_id=self.interplm_repo_id,
+            normalized=self.interplm_normalized,
+            map_location="cpu",
+        )
+        sae_feature_dim = int(sae.feature_dim)
+        del sae
+        if self.low_rank_input == "sae":
+            return sae_feature_dim
+        return int(embedding_dim) + sae_feature_dim
+
+    def _representation_name(self):
+        base = (
+            "interplm_source_residue_embeddings_v1"
+            if self.low_rank_input == "esm"
+            else (
+                "interplm_source_sae_residue_embeddings_v1"
+                if self.low_rank_input == "sae"
+                else "interplm_source_esm_sae_concat_residue_embeddings_v1"
+            )
+        )
+        return (
+            f"{base}__layer_{self.interplm_layer}"
+            f"__repo_{self.interplm_repo_id.replace('/', '__')}"
+            f"__normalized_{self.interplm_normalized}"
+        )
+
+    def _get_sae(self):
+        if self._sae is None:
+            shared_pool = getattr(self.args, "interplm_sae_pool", None)
+            if shared_pool is not None:
+                self._sae = shared_pool.get(
+                    plm_layer=self.interplm_layer,
+                    repo_id=self.interplm_repo_id,
+                    normalized=self.interplm_normalized,
+                    device=self.device,
+                )
+            else:
+                self._sae = load_interplm_sae(
+                    plm_layer=self.interplm_layer,
+                    repo_id=self.interplm_repo_id,
+                    normalized=self.interplm_normalized,
+                    map_location=self.device,
+                ).to(self.device)
+                self._sae.eval()
+                for parameter in self._sae.parameters():
+                    parameter.requires_grad = False
+        return self._sae
+
+    def _compute_sequence_representations(self, sequences):
+        if not sequences:
+            return torch.empty(
+                (0, self.seq_length, self.net.embedding_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        residue_sequence_embeddings = []
+        batch_size = max(1, int(self.representation_batch_size))
+        start = 0
+        while start < len(sequences):
+            batch_end = min(start + batch_size, len(sequences))
+            batch_sequences = sequences[start:batch_end]
+            try:
+                input_ids, attention_mask = self._tokenize_batch(batch_sequences)
+                attention_mask = attention_mask.to(self.device)
+                with torch.no_grad():
+                    outputs = self._esm_outputs(
+                        input_ids,
+                        attention_mask,
+                        output_hidden_states=True,
+                    )
+                    if outputs.hidden_states is None:
+                        raise RuntimeError("ESM model did not return hidden states.")
+                    batch_embeddings = extract_residue_embeddings(
+                        outputs.hidden_states[self.interplm_layer],
+                        attention_mask,
+                        expected_sequence_length=self.seq_length,
+                    ).to(torch.float32)
+                    if self.low_rank_input in {"sae", "esm_sae_concat"}:
+                        sae = self._get_sae()
+                        batch_n, sequence_length, _ = batch_embeddings.shape
+                        flattened = batch_embeddings.reshape(batch_n * sequence_length, -1)
+                        projected_chunks = []
+                        chunk_size = max(1, int(self.sae_token_chunk_size))
+                        for chunk_start in range(0, flattened.shape[0], chunk_size):
+                            chunk_stop = min(
+                                flattened.shape[0],
+                                chunk_start + chunk_size,
+                            )
+                            projected_chunks.append(
+                                sae.encode(flattened[chunk_start:chunk_stop]).to(
+                                    torch.float32
+                                )
+                            )
+                        sae_embeddings = torch.cat(projected_chunks, dim=0).reshape(
+                            batch_n,
+                            sequence_length,
+                            -1,
+                        )
+                        if self.low_rank_input == "sae":
+                            batch_embeddings = sae_embeddings
+                        else:
+                            batch_embeddings = torch.cat(
+                                [batch_embeddings, sae_embeddings], dim=-1
+                            )
+                residue_sequence_embeddings.append(batch_embeddings)
+                start = batch_end
+            except torch.OutOfMemoryError:
+                if batch_size == 1:
+                    raise
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                batch_size = max(1, batch_size // 2)
+                logger.warning(
+                    "OOM in low-rank positional representation extraction; retrying with micro-batch size=%d",
+                    batch_size,
+                )
+
+        return torch.cat(residue_sequence_embeddings, dim=0)
+
+    def get_data_loader(self, sequences, labels, shuffle):
+        normalized_sequences = normalize_sequences(sequences)
+        labels_tensor = torch.from_numpy(np.asarray(labels, dtype=np.float32)).float()
+        batch_size = max(
+            1,
+            min(int(self.args.proxy_batch_size), int(self.representation_batch_size)),
+        )
+        dataset = SequenceLabelDataset(normalized_sequences, labels_tensor)
+        return torch.utils.data.DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+        )
+
+    @torch.no_grad()
+    def _prepare_feature_stats(self, train_sequences):
+        input_dim = int(getattr(self.net, "embedding_dim", self.embedding_dim))
+        sums = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
+        sums_sq = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
+        total_tokens = 0
+        batch_size = max(1, int(self.representation_batch_size))
+        for start in range(0, len(train_sequences), batch_size):
+            batch_sequences = train_sequences[start : start + batch_size]
+            reps = self.get_sequence_representations(batch_sequences)
+            flat = reps.reshape(-1, reps.shape[-1])
+            sums += flat.sum(dim=0)
+            sums_sq += (flat * flat).sum(dim=0)
+            total_tokens += int(flat.shape[0])
+        if total_tokens < 1:
+            mean = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
+            std = torch.ones(input_dim, dtype=torch.float32, device=self.device)
+        else:
+            mean = sums / float(total_tokens)
+            var = (sums_sq / float(total_tokens)) - mean * mean
+            std = torch.sqrt(torch.clamp(var, min=1e-6))
+        self.net.set_feature_stats(mean, std)
+        self._feature_stats_ready = True
+
+    def compute_loss(self, data):
+        sequences, labels = data
+        sequence_representations = self.get_sequence_representations(
+            list(sequences)
+        )
+        predictions = self.net(sequence_representations).squeeze(-1)
+        labels = labels.to(self.device)
+        mse = F.mse_loss(predictions, labels)
+        reg = self.low_rank_l2 * (
+            torch.sum(self.net.position_factors * self.net.position_factors)
+            + torch.sum(self.net.feature_projection * self.net.feature_projection)
+        )
+        return mse + reg
+
+    def train(self, dataset):
+        self._feature_stats_ready = False
+        train_sequences = normalize_sequences(dataset.train)
+        self._prepare_feature_stats(train_sequences)
+        super().train(dataset)
+
+    def get_fitness(self, sequences):
+        self.net.eval()
+        with torch.no_grad():
+            normalized_sequences = normalize_sequences(sequences)
+            if not normalized_sequences:
+                return torch.empty((0,), dtype=torch.float32, device=self.device)
+            predictions = []
+            batch_size = max(1, int(self.representation_batch_size))
+            for start in range(0, len(normalized_sequences), batch_size):
+                batch_sequences = normalized_sequences[start : start + batch_size]
+                batch_representations = self.get_sequence_representations(
+                    batch_sequences,
+                    cache_mode=FrozenESMModel.CacheMode.EVAL,
+                )
+                predictions.append(self.net(batch_representations).squeeze(-1))
+        return torch.cat(predictions, dim=0)
+
+
 class OneHotSklearnModel:
     def __init__(self, seq_length, args, regression_type):
         self.seq_length = seq_length
@@ -1403,6 +1701,14 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
             seq_length,
             args,
             regression_type="ridge",
+            tokenizer=tokenizer,
+            esm=esm,
+            cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
+        )
+    if args.surrogate_arch == "interplm_low_rank_positional":
+        return InterPLMLowRankPositionalModel(
+            seq_length,
+            args,
             tokenizer=tokenizer,
             esm=esm,
             cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),

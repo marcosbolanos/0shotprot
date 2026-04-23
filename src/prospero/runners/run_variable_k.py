@@ -310,6 +310,31 @@ def _build_protein_args(
     protein_args.interplm_repo_id = runner_args.interplm_repo_id
     protein_args.interplm_normalized = runner_args.interplm_normalized
     protein_args.sae_token_chunk_size = runner_args.sae_token_chunk_size
+    protein_args.low_rank_positional_rank = getattr(
+        runner_args,
+        "low_rank_positional_rank",
+        16,
+    )
+    protein_args.low_rank_positional_l2 = getattr(
+        runner_args,
+        "low_rank_positional_l2",
+        1e-4,
+    )
+    protein_args.low_rank_positional_lr = getattr(
+        runner_args,
+        "low_rank_positional_lr",
+        None,
+    )
+    protein_args.low_rank_positional_repr_batch_size = getattr(
+        runner_args,
+        "low_rank_positional_repr_batch_size",
+        None,
+    )
+    protein_args.low_rank_positional_input = getattr(
+        runner_args,
+        "low_rank_positional_input",
+        "sae",
+    )
     protein_args.disable_esm_cache = runner_args.disable_esm_cache
     protein_args.debug_events = runner_args.debug_events
     protein_args.debug_heartbeat_seconds = runner_args.debug_heartbeat_seconds
@@ -319,7 +344,10 @@ def _build_protein_args(
         protein_args.ensemble_size = ensemble_size
     if proxy_batch_size is not None:
         protein_args.proxy_batch_size = proxy_batch_size
-    if runner_args.surrogate_arch == "interplm_mean_pool_ridge":
+    if runner_args.surrogate_arch in {
+        "interplm_mean_pool_ridge",
+        "interplm_low_rank_positional",
+    }:
         if ensemble_size is None:
             protein_args.ensemble_size = 1
     return protein_args
@@ -386,6 +414,7 @@ def _run_seed_in_process_with_retries(
 def main() -> None:
     frozen_esm_surrogate_archs = {
         "interplm_mean_pool_ridge",
+        "interplm_low_rank_positional",
         "frozen_esm_mlp",
         "frozen_esm_cnn",
         "frozen_esm_flat_linear",
@@ -405,6 +434,7 @@ def main() -> None:
             "cnn",
             "one_hot_ridge",
             "interplm_mean_pool_ridge",
+            "interplm_low_rank_positional",
             "frozen_esm_mlp",
             "frozen_esm_cnn",
             "frozen_esm_flat_linear",
@@ -437,11 +467,20 @@ def main() -> None:
         default=True,
     )
     parser.add_argument("--sae-token-chunk-size", type=int, default=1024)
+    parser.add_argument("--low-rank-positional-rank", type=int, default=16)
+    parser.add_argument("--low-rank-positional-l2", type=float, default=1e-4)
+    parser.add_argument("--low-rank-positional-lr", type=float, default=None)
+    parser.add_argument("--low-rank-positional-repr-batch-size", type=int, default=None)
+    parser.add_argument(
+        "--low-rank-positional-input",
+        choices=("esm", "sae", "esm_sae_concat"),
+        default="sae",
+    )
     parser.add_argument(
         "--ensemble-size",
         type=int,
         default=None,
-        help="Override surrogate ensemble size. Defaults to 1 for interplm_mean_pool_ridge.",
+        help="Override surrogate ensemble size. Defaults to 1 for InterPLM ridge/low-rank surrogate arches.",
     )
     parser.add_argument(
         "--proxy-batch-size",
@@ -644,6 +683,38 @@ def main() -> None:
                         cmd_template.append("--no-interplm_normalized")
                     cmd_template.extend(
                         ["--sae_token_chunk_size", str(args.sae_token_chunk_size)]
+                    )
+                    cmd_template.extend(
+                        [
+                            "--low_rank_positional_rank",
+                            str(args.low_rank_positional_rank),
+                        ]
+                    )
+                    cmd_template.extend(
+                        [
+                            "--low_rank_positional_l2",
+                            str(args.low_rank_positional_l2),
+                        ]
+                    )
+                    if args.low_rank_positional_lr is not None:
+                        cmd_template.extend(
+                            [
+                                "--low_rank_positional_lr",
+                                str(args.low_rank_positional_lr),
+                            ]
+                        )
+                    if args.low_rank_positional_repr_batch_size is not None:
+                        cmd_template.extend(
+                            [
+                                "--low_rank_positional_repr_batch_size",
+                                str(args.low_rank_positional_repr_batch_size),
+                            ]
+                        )
+                    cmd_template.extend(
+                        [
+                            "--low_rank_positional_input",
+                            str(args.low_rank_positional_input),
+                        ]
                     )
                     if not args.ridge_fit_intercept:
                         cmd_template.append("--no-ridge_fit_intercept")

@@ -415,6 +415,97 @@ def test_interplm_ridge_surrogate_fit_predict(monkeypatch, tmp_path):
     assert torch.isfinite(predictions).all()
 
 
+def test_build_surrogate_model_supports_interplm_low_rank_positional(
+    monkeypatch, tmp_path
+):
+    fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name, **kwargs: fake_esm,
+    )
+    monkeypatch.setattr(
+        surrogate,
+        "load_interplm_sae",
+        lambda **kwargs: make_fake_sae(input_dim=fake_esm.config.hidden_size),
+    )
+
+    model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="interplm_low_rank_positional",
+            interplm_layer=2,
+            interplm_repo_id="fake/interplm",
+            interplm_normalized=True,
+            low_rank_positional_rank=4,
+            low_rank_positional_l2=1e-4,
+            low_rank_positional_input="sae",
+            disable_esm_cache=True,
+        ),
+    )
+
+    assert isinstance(model, surrogate.InterPLMLowRankPositionalModel)
+    assert model.low_rank_input == "sae"
+    assert model.rank == 4
+
+
+def test_interplm_low_rank_positional_fit_predict(monkeypatch, tmp_path):
+    fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name, **kwargs: fake_esm,
+    )
+    monkeypatch.setattr(
+        surrogate,
+        "load_interplm_sae",
+        lambda **kwargs: make_fake_sae(input_dim=fake_esm.config.hidden_size),
+    )
+    model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="interplm_low_rank_positional",
+            interplm_layer=2,
+            interplm_repo_id="fake/interplm",
+            interplm_normalized=False,
+            sae_token_chunk_size=4,
+            low_rank_positional_rank=4,
+            low_rank_positional_l2=1e-4,
+            low_rank_positional_input="sae",
+            num_model_max_epochs=2,
+            patience=2,
+            disable_esm_cache=True,
+        ),
+    )
+    dataset = SimpleNamespace(
+        train=np.array(["ACDEF", "AAAAC", "CCCCC"], dtype=object),
+        train_scores=np.array([1.0, 2.0, 0.5], dtype=np.float32),
+        valid=np.array(["DDDDE"], dtype=object),
+        valid_scores=np.array([0.2], dtype=np.float32),
+    )
+    model.train(dataset)
+    predictions = model.get_fitness(["ACDEF", "DDDDE"])
+
+    assert predictions.shape == (2,)
+    assert torch.isfinite(predictions).all()
+
+
 def test_runner_plumbing_preserves_interplm_configuration(tmp_path):
     runner_args = SimpleNamespace(
         task="LGK",
@@ -456,6 +547,62 @@ def test_runner_plumbing_preserves_interplm_configuration(tmp_path):
     )
     assert parsed.surrogate_arch == "interplm_mean_pool_ridge"
     assert parsed.interplm_layer == 2
+
+
+def test_runner_plumbing_preserves_low_rank_positional_configuration(tmp_path):
+    runner_args = SimpleNamespace(
+        task="LGK",
+        alphabet="RANDOM",
+        surrogate_arch="interplm_low_rank_positional",
+        min_corruptions=3,
+        max_corruptions=10,
+        esm_cnn_projection_dim=None,
+        esm_cnn_use_layernorm=False,
+        esm_cnn_concat_one_hot=False,
+        esm_model_name="facebook/esm2_t6_8M_UR50D",
+        esm_max_length=None,
+        ridge_alpha=0.01,
+        ridge_fit_intercept=True,
+        interplm_layer=2,
+        interplm_repo_id="Elana/InterPLM-esm2-8m",
+        interplm_normalized=True,
+        sae_token_chunk_size=2048,
+        low_rank_positional_rank=12,
+        low_rank_positional_l2=5e-5,
+        low_rank_positional_lr=3e-4,
+        low_rank_positional_repr_batch_size=8,
+        low_rank_positional_input="sae",
+        disable_esm_cache=False,
+        debug_events=False,
+        debug_heartbeat_seconds=15.0,
+    )
+    protein_args = run_variable_k._build_protein_args(
+        runner_args=runner_args,
+        batch_dir=tmp_path / "results",
+        n_iters=10,
+        n_queries=8,
+        seed=5,
+    )
+    assert protein_args.surrogate_arch == "interplm_low_rank_positional"
+    assert protein_args.low_rank_positional_rank == 12
+    assert protein_args.low_rank_positional_l2 == 5e-5
+    assert protein_args.low_rank_positional_lr == 3e-4
+    assert protein_args.low_rank_positional_repr_batch_size == 8
+    assert protein_args.low_rank_positional_input == "sae"
+    assert protein_args.ensemble_size == 1
+    parsed = run_protein.get_parser().parse_args(
+        [
+            "--surrogate_arch",
+            "interplm_low_rank_positional",
+            "--low_rank_positional_rank",
+            "12",
+            "--low_rank_positional_input",
+            "sae",
+        ]
+    )
+    assert parsed.surrogate_arch == "interplm_low_rank_positional"
+    assert parsed.low_rank_positional_rank == 12
+    assert parsed.low_rank_positional_input == "sae"
 
 
 def test_flat_esm_dataset_store_reuses_embeddings_across_model_instances(
