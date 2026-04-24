@@ -659,19 +659,25 @@ class FrozenESMModel:
         self.esm_forward_lock = getattr(args, "esm_forward_lock", None)
         self.esm_batch_worker = getattr(args, "esm_batch_worker", None)
         self.esm_in_memory_cache_pool = getattr(args, "esm_in_memory_cache_pool", None)
+        self.evolutionary_backend = getattr(args, "evolutionary_backend", None)
         if self.esm_in_memory_cache_pool is None:
             self.esm_in_memory_cache_pool = SharedInMemoryESMCachePool(
                 storage_dtype=torch.float16
             )
-        from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
+        if self.evolutionary_backend is not None:
+            self.tokenizer = tokenizer
+            self.esm = esm
+            embedding_dim = int(self.evolutionary_backend.hidden_size)
+        else:
+            from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
-        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
-        self.esm = (esm or AutoModel.from_pretrained(model_name)).to(self.device)
-        self.esm.eval()
-        for param in self.esm.parameters():
-            param.requires_grad = False
+            self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
+            self.esm = (esm or AutoModel.from_pretrained(model_name)).to(self.device)
+            self.esm.eval()
+            for param in self.esm.parameters():
+                param.requires_grad = False
 
-        embedding_dim = self.esm.config.hidden_size
+            embedding_dim = self.esm.config.hidden_size
         self.embedding_dim = embedding_dim
         self.representation_name = representation_name
         self.model_name = model_name
@@ -731,6 +737,10 @@ class FrozenESMModel:
         return loader
 
     def _tokenize_batch(self, sequences):
+        if self.evolutionary_backend is not None:
+            raise RuntimeError(
+                "_tokenize_batch is not available with EvolutionaryScale backend."
+            )
         tokenizer_kwargs = {
             "return_tensors": "pt",
             "padding": True,
@@ -745,6 +755,10 @@ class FrozenESMModel:
         raise NotImplementedError
 
     def _esm_outputs(self, input_ids, attention_mask, output_hidden_states=False):
+        if self.evolutionary_backend is not None:
+            raise RuntimeError(
+                "_esm_outputs is not available with EvolutionaryScale backend."
+            )
         if self.esm_forward_lock is None:
             return self.esm(
                 input_ids=input_ids.to(self.device),
@@ -765,6 +779,21 @@ class FrozenESMModel:
             attention_mask,
             output_hidden_states=False,
         ).last_hidden_state
+
+    def _compute_with_evolutionary_backend(
+        self,
+        sequences,
+        *,
+        representation_name,
+        expected_sequence_length=None,
+    ):
+        if self.evolutionary_backend is None:
+            return None
+        return self.evolutionary_backend.compute_representations(
+            sequences,
+            representation_name=representation_name,
+            expected_sequence_length=expected_sequence_length,
+        )
 
     def _maybe_preload_persistent_dataset_store(self, sequences):
         if (
@@ -993,6 +1022,13 @@ class FrozenESMMeanPooledModel(FrozenESMModel):
         if not sequences:
             return torch.empty((0, self.embedding_dim), dtype=torch.float32)
 
+        backend_representations = self._compute_with_evolutionary_backend(
+            sequences,
+            representation_name="mean_pool_residue_embeddings_v1",
+        )
+        if backend_representations is not None:
+            return backend_representations
+
         if self.esm_batch_worker is not None:
             return self.esm_batch_worker.compute(
                 sequences=sequences,
@@ -1050,6 +1086,14 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
             return torch.empty(
                 (0, self.seq_length, self.embedding_dim), dtype=torch.float32
             )
+
+        backend_representations = self._compute_with_evolutionary_backend(
+            sequences,
+            representation_name="per_residue_embeddings_v1",
+            expected_sequence_length=self.seq_length,
+        )
+        if backend_representations is not None:
+            return backend_representations
 
         if self.esm_batch_worker is not None:
             return self.esm_batch_worker.compute(
@@ -1158,6 +1202,14 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
             return torch.empty(
                 (0, self.seq_length, self.embedding_dim), dtype=torch.float32
             )
+
+        backend_representations = self._compute_with_evolutionary_backend(
+            sequences,
+            representation_name="per_residue_embeddings_v1",
+            expected_sequence_length=self.seq_length,
+        )
+        if backend_representations is not None:
+            return backend_representations
 
         if self.esm_batch_worker is not None:
             return self.esm_batch_worker.compute(
@@ -1675,6 +1727,7 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
     esm_batch_worker = None
     esm_in_memory_cache_pool = None
     interplm_sae_pool = None
+    evolutionary_backend = None
     if shared_esm_components is not None:
         if hasattr(shared_esm_components, "tokenizer"):
             tokenizer = shared_esm_components.tokenizer
@@ -1685,12 +1738,16 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
                 shared_esm_components, "esm_in_memory_cache_pool", None
             )
             interplm_sae_pool = getattr(shared_esm_components, "interplm_sae_pool", None)
+            evolutionary_backend = getattr(
+                shared_esm_components, "evolutionary_backend", None
+            )
         elif isinstance(shared_esm_components, tuple):
             tokenizer, esm = shared_esm_components
     args.esm_forward_lock = esm_forward_lock
     args.esm_batch_worker = esm_batch_worker
     args.esm_in_memory_cache_pool = esm_in_memory_cache_pool
     args.interplm_sae_pool = interplm_sae_pool
+    args.evolutionary_backend = evolutionary_backend
 
     if args.surrogate_arch == "one_hot_ridge":
         return OneHotSklearnModel(
@@ -1777,44 +1834,60 @@ class SharedESMComponents:
     esm_batch_worker: SharedESMBatchWorker | None = None
     esm_in_memory_cache_pool: SharedInMemoryESMCachePool | None = None
     interplm_sae_pool: SharedInterPLMSAEPool | None = None
+    evolutionary_backend: object | None = None
 
 
 def prepare_shared_esm_components(args):
+    from .plm import EvolutionaryScaleBackend, is_evolutionaryscale_model
     from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("[shared-esm] loading tokenizer from local cache", flush=True)
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = None
+    esm = None
+    esm_forward_lock = None
+    esm_batch_worker = None
+    evolutionary_backend = None
+
+    if is_evolutionaryscale_model(args.esm_model_name):
+        print("[shared-esm] loading EvolutionaryScale backend", flush=True)
+        evolutionary_backend = EvolutionaryScaleBackend.load(
             args.esm_model_name,
-            local_files_only=True,
+            device=device,
         )
-    except Exception:
-        print("[shared-esm] local tokenizer cache miss, falling back to hub", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained(args.esm_model_name)
+        print(f"[shared-esm] shared EvolutionaryScale backend loaded on {device}", flush=True)
+    else:
+        print("[shared-esm] loading tokenizer from local cache", flush=True)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                args.esm_model_name,
+                local_files_only=True,
+            )
+        except Exception:
+            print("[shared-esm] local tokenizer cache miss, falling back to hub", flush=True)
+            tokenizer = AutoTokenizer.from_pretrained(args.esm_model_name)
 
-    print("[shared-esm] loading model from local cache", flush=True)
-    try:
-        esm = AutoModel.from_pretrained(
-            args.esm_model_name,
-            local_files_only=True,
-        ).to(device)
-    except Exception:
-        print("[shared-esm] local model cache miss, falling back to hub", flush=True)
-        esm = AutoModel.from_pretrained(args.esm_model_name).to(device)
+        print("[shared-esm] loading model from local cache", flush=True)
+        try:
+            esm = AutoModel.from_pretrained(
+                args.esm_model_name,
+                local_files_only=True,
+            ).to(device)
+        except Exception:
+            print("[shared-esm] local model cache miss, falling back to hub", flush=True)
+            esm = AutoModel.from_pretrained(args.esm_model_name).to(device)
 
-    print(f"[shared-esm] shared ESM model loaded on {device}", flush=True)
-    esm.eval()
-    for param in esm.parameters():
-        param.requires_grad = False
-    esm_forward_lock = threading.Lock()
-    esm_batch_worker = SharedESMBatchWorker(
-        tokenizer=tokenizer,
-        esm=esm,
-        device=device,
-        max_batch_sequences=getattr(args, "shared_esm_max_batch_sequences", 512),
-        max_wait_ms=getattr(args, "shared_esm_max_wait_ms", 4.0),
-    )
+        print(f"[shared-esm] shared ESM model loaded on {device}", flush=True)
+        esm.eval()
+        for param in esm.parameters():
+            param.requires_grad = False
+        esm_forward_lock = threading.Lock()
+        esm_batch_worker = SharedESMBatchWorker(
+            tokenizer=tokenizer,
+            esm=esm,
+            device=device,
+            max_batch_sequences=getattr(args, "shared_esm_max_batch_sequences", 512),
+            max_wait_ms=getattr(args, "shared_esm_max_wait_ms", 4.0),
+        )
     esm_in_memory_cache_pool = SharedInMemoryESMCachePool(storage_dtype=torch.float16)
     interplm_sae_pool = SharedInterPLMSAEPool()
     return SharedESMComponents(
@@ -1824,4 +1897,5 @@ def prepare_shared_esm_components(args):
         esm_batch_worker=esm_batch_worker,
         esm_in_memory_cache_pool=esm_in_memory_cache_pool,
         interplm_sae_pool=interplm_sae_pool,
+        evolutionary_backend=evolutionary_backend,
     )
