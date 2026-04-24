@@ -127,7 +127,7 @@ def get_parser():
     return parser
 
 
-def run_iter(args, logger, shared_esm_components=None):
+def run_iter(args, logger, shared_esm_components=None, shared_oracle=None):
     seed = args.seed
     set_seed(seed, args.full_deterministic)
     logger.info(f"Starting seed {seed}")
@@ -139,7 +139,7 @@ def run_iter(args, logger, shared_esm_components=None):
     save_path = os.path.join(save_dir, f"seed_{seed}.pkl")
 
     wt_sequence = WT_SEQUENCES[args.task]
-    oracle = get_landscape(args.task)
+    oracle = shared_oracle if shared_oracle is not None else get_landscape(args.task)
     dataset = RegressionDataset(args.task)
     if args.disable_esm_cache:
         args.cache_allowed_sequences = set()

@@ -47,6 +47,18 @@ class SharedESMComponents:
     esm_in_memory_cache_pool: object | None = None
 
 
+class ThreadSafeOracle:
+    """Serialize oracle calls so one shared oracle can serve multiple seeds safely."""
+
+    def __init__(self, oracle: object) -> None:
+        self._oracle = oracle
+        self._lock = threading.Lock()
+
+    def get_fitness(self, sequences):
+        with self._lock:
+            return self._oracle.get_fitness(sequences)
+
+
 def parse_int_list(value: str) -> list[int]:
     try:
         return [int(item) for item in value.split(",") if item]
@@ -190,29 +202,36 @@ def _build_protein_args(
 def _run_seed_in_process(
     protein_args: argparse.Namespace,
     shared_esm_components,
+    shared_oracle,
 ) -> None:
     from prospero.runners.run_protein import (
         logger as protein_logger,
         run_iter as run_protein_iter,
     )
 
-    print(f"[shared-esm] starting seed {protein_args.seed}", flush=True)
+    print(f"[in-process] starting seed {protein_args.seed}", flush=True)
     try:
-        run_protein_iter(protein_args, protein_logger, shared_esm_components)
+        run_protein_iter(
+            protein_args,
+            protein_logger,
+            shared_esm_components,
+            shared_oracle=shared_oracle,
+        )
     except Exception:
         print(
-            f"[shared-esm] seed {protein_args.seed} raised an exception",
+            f"[in-process] seed {protein_args.seed} raised an exception",
             file=sys.stderr,
             flush=True,
         )
         traceback.print_exc()
         raise
-    print(f"[shared-esm] finished seed {protein_args.seed}", flush=True)
+    print(f"[in-process] finished seed {protein_args.seed}", flush=True)
 
 
 def _run_seed_in_process_with_retries(
     protein_args: argparse.Namespace,
     shared_esm_components,
+    shared_oracle,
     *,
     safe: bool,
     max_seed_retries: int,
@@ -221,7 +240,7 @@ def _run_seed_in_process_with_retries(
     total_attempts = 1 + (max_seed_retries if safe else 0)
     for attempt in range(1, total_attempts + 1):
         try:
-            _run_seed_in_process(protein_args, shared_esm_components)
+            _run_seed_in_process(protein_args, shared_esm_components, shared_oracle)
             return
         except Exception:
             if attempt >= total_attempts:
@@ -302,6 +321,15 @@ def main() -> None:
     )
     parser.add_argument("--n-queries-base", type=int, default=None)
     parser.add_argument("--uv-cache-dir", default=os.environ.get("UV_CACHE_DIR"))
+    parser.add_argument(
+        "--share-oracle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Share a single oracle instance across in-process seed workers. "
+            "Defaults to enabled for D_SHIFT* tasks."
+        ),
+    )
     args = parser.parse_args()
 
     results_dir = args.results_dir
@@ -325,9 +353,19 @@ def main() -> None:
             )
             run_cache_scope.mkdir(parents=True, exist_ok=True)
             share_frozen_esm = args.surrogate_arch in frozen_esm_surrogate_archs
+            share_oracle = (
+                args.task.startswith("D_SHIFT")
+                if args.share_oracle is None
+                else args.share_oracle
+            )
             if share_frozen_esm:
                 print(
                     f"[shared-esm] enabled by default for {args.surrogate_arch}",
+                    flush=True,
+                )
+            if share_oracle:
+                print(
+                    f"[shared-oracle] enabled for task {args.task}",
                     flush=True,
                 )
             if args.safe:
@@ -340,6 +378,16 @@ def main() -> None:
                 f"[shared-esm] run cache scope: {run_cache_scope}",
                 flush=True,
             )
+            shared_oracle = None
+            if share_oracle:
+                from prospero.landscapes import get_landscape
+
+                print(
+                    f"[shared-oracle] loading oracle once for task {args.task}",
+                    flush=True,
+                )
+                shared_oracle = ThreadSafeOracle(get_landscape(args.task))
+                print("[shared-oracle] ready", flush=True)
 
             total_runs = len(n_samples_values) * len(seeds)
             with tqdm(
@@ -404,7 +452,8 @@ def main() -> None:
 
                     errors: list[tuple[Sequence[str], Exception]] = []
                     seed_cmds = [cmd_template + ["--seed", str(seed)] for seed in seeds]
-                    if share_frozen_esm:
+                    use_in_process_runner = share_frozen_esm or share_oracle
+                    if use_in_process_runner:
                         executor_workers = max_workers
                         with concurrent.futures.ThreadPoolExecutor(
                             max_workers=executor_workers
@@ -413,12 +462,13 @@ def main() -> None:
                             shared_esm_components = None
                             if args.uv_cache_dir:
                                 os.environ["UV_CACHE_DIR"] = args.uv_cache_dir
-                            print(
-                                f"[shared-esm] preparing shared ESM for {args.surrogate_arch}",
-                                flush=True,
-                            )
-                            shared_esm_components = prepare_shared_esm_components(args)
-                            print("[shared-esm] shared ESM ready", flush=True)
+                            if share_frozen_esm:
+                                print(
+                                    f"[shared-esm] preparing shared ESM for {args.surrogate_arch}",
+                                    flush=True,
+                                )
+                                shared_esm_components = prepare_shared_esm_components(args)
+                                print("[shared-esm] shared ESM ready", flush=True)
                             for seed in seeds:
                                 protein_args = _build_protein_args(
                                     runner_args=args,
@@ -435,6 +485,7 @@ def main() -> None:
                                     _run_seed_in_process_with_retries,
                                     deepcopy(protein_args),
                                     shared_esm_components,
+                                    shared_oracle,
                                     safe=args.safe,
                                     max_seed_retries=args.max_seed_retries,
                                     retry_backoff_seconds=args.retry_backoff_seconds,
