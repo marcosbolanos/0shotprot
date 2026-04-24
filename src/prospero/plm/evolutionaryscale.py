@@ -98,7 +98,9 @@ class EvolutionaryScaleBackend:
             raise ValueError(
                 f"Unexpected token length {residue_embeddings.shape[0]} for sequence length {seq_len}."
             )
-        return residue_embeddings.to(torch.float32)
+        # Keep backend outputs on CPU so they are compatible with the shared
+        # representation cache/store pipeline.
+        return residue_embeddings.to(torch.float32).cpu()
 
     @torch.no_grad()
     def compute_representations(

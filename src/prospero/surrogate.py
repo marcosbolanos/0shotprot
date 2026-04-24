@@ -702,9 +702,12 @@ class FrozenESMModel:
             if self.cache_allowed_sequences_ordered
             else None
         )
+        # EvolutionaryScale backends can produce very large per-residue tensors
+        # (notably ESM3); avoid on-disk dataset cache writes in this mode.
+        allow_dataset_store = enable_dataset_store and self.evolutionary_backend is None
         self.dataset_representation_store = (
             PersistentDatasetRepresentationStore(get_persistent_dataset_store_root())
-            if enable_dataset_store
+            if allow_dataset_store
             and self.dataset_cache_task is not None
             and self.dataset_fingerprint is not None
             else None

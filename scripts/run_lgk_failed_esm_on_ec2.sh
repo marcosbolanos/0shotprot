@@ -144,9 +144,13 @@ mkdir -p repo
 tar -xzf source.tar.gz -C repo
 cd repo
 
-if aws s3 ls "__ORACLES_S3_URI__/" >/dev/null 2>&1; then
-  echo "Syncing oracle assets from __ORACLES_S3_URI__ to ${WORKDIR}/repo/oracles"
-  aws s3 sync "__ORACLES_S3_URI__/" "${WORKDIR}/repo/oracles/"
+echo "Syncing oracle assets from __ORACLES_S3_URI__ to ${WORKDIR}/repo/oracles"
+aws s3 sync "__ORACLES_S3_URI__/" "${WORKDIR}/repo/oracles/"
+if [[ ! -f "${WORKDIR}/repo/oracles/__TASK__/pytorch_model.bin" ]]; then
+  echo "Missing oracle checkpoint: ${WORKDIR}/repo/oracles/__TASK__/pytorch_model.bin"
+  echo "Available oracle files under ${WORKDIR}/repo/oracles:"
+  find "${WORKDIR}/repo/oracles" -maxdepth 3 -type f | sort | head -n 200
+  shutdown -h now
 fi
 
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -366,8 +370,26 @@ run_model() {
   mkdir -p "${model_dir}"
   local started
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  {
+    echo "[preflight] python/uv/esm environment check"
+    uv --version || true
+    uv sync --locked || true
+    uv run --locked python - <<'PY'
+import sys
+try:
+    import esm
+    import esm.pretrained as p
+    print("python", sys.version)
+    print("esm_version", getattr(esm, "__version__", "unknown"))
+    print("esm_file", getattr(esm, "__file__", "unknown"))
+    print("pretrained_file", getattr(p, "__file__", "unknown"))
+    print("has_load_local_model", hasattr(p, "load_local_model"))
+except Exception as exc:
+    print("esm_preflight_error", repr(exc))
+PY
+  } >> "${model_dir}/run.log" 2>&1
   set +e
-  /usr/bin/time -v uv run python -m prospero.runners.run_single_mutant_energy_test \
+  /usr/bin/time -v uv run --locked python -m prospero.runners.run_single_mutant_energy_test \
     --tasks "__TASK__" \
     --seed 1 \
     --surrogate_arch frozen_esm_flat_ridge_no_onehot \
