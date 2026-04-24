@@ -4,18 +4,23 @@ import torch.nn.functional as F
 import numpy as np
 import sys
 import logging
-import hashlib
 import threading
 import time
 from dataclasses import dataclass
 from concurrent.futures import Future
-from pathlib import Path
 from enum import Enum
-from time import sleep
+from pathlib import Path
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.preprocessing import StandardScaler
 
-from .esm.cache import ESMEmbeddingFileCache
+from .representations.dataset_store import PersistentDatasetRepresentationStore
+from .representations.interplm import (
+    DEFAULT_INTERPLM_REPO_ID,
+    SharedInterPLMSAEPool,
+    build_interplm_representation_name,
+    load_interplm_sae,
+    mean_pool_sae_activations,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -64,9 +69,15 @@ class InMemoryESMEmbeddingCache:
                     embedding.detach().cpu().to(self.storage_dtype).to(torch.float32)
                 )
 
+    def clear(self) -> int:
+        with self._lock:
+            cleared = len(self._store)
+            self._store.clear()
+        return cleared
+
 
 class SharedInMemoryESMCachePool:
-    """Provides shared persistent/run-scoped RAM caches across workers/models."""
+    """Provides shared persistent RAM caches across workers/models."""
 
     def __init__(self, storage_dtype=torch.float16):
         self.storage_dtype = storage_dtype
@@ -86,7 +97,6 @@ class SharedInMemoryESMCachePool:
                 cache = InMemoryESMEmbeddingCache(storage_dtype=self.storage_dtype)
                 self._caches[key] = cache
             return cache
-
 
 class SharedESMBatchWorker:
     def __init__(
@@ -351,6 +361,10 @@ def get_esm_embedding_cache_path():
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / "esm_embeddings"
 
+
+def get_persistent_dataset_store_root():
+    return get_esm_embedding_cache_path().parent / "dataset_representations"
+
 class TorchModel:
     def __init__(self, args, alphabet, net, **kwargs):
         self.args = args
@@ -543,6 +557,47 @@ class ESMMeanPooledRegressor(nn.Module):
         return self.mlp(pooled_sequence_embeddings)
 
 
+class LowRankPositionalRegressor(nn.Module):
+    def __init__(self, seq_length: int, embedding_dim: int, rank: int) -> None:
+        super().__init__()
+        self.seq_length = int(seq_length)
+        self.embedding_dim = int(embedding_dim)
+        self.rank = int(rank)
+        self.position_factors = nn.Parameter(torch.zeros(self.seq_length, self.rank))
+        self.feature_projection = nn.Parameter(
+            torch.randn(self.rank, self.embedding_dim) * 0.02
+        )
+        self.bias = nn.Parameter(torch.zeros(1))
+        self.register_buffer("feature_mean", torch.zeros(self.embedding_dim))
+        self.register_buffer("feature_std", torch.ones(self.embedding_dim))
+
+    @torch.no_grad()
+    def set_feature_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        self.feature_mean.copy_(
+            mean.to(
+                device=self.feature_mean.device,
+                dtype=self.feature_mean.dtype,
+            )
+        )
+        self.feature_std.copy_(
+            torch.clamp(
+                std.to(
+                    device=self.feature_std.device,
+                    dtype=self.feature_std.dtype,
+                ),
+                min=1e-6,
+            )
+        )
+
+    def forward(self, residue_embeddings: torch.Tensor) -> torch.Tensor:
+        mean = self.feature_mean.to(residue_embeddings.dtype)
+        std = self.feature_std.to(residue_embeddings.dtype)
+        normalized = (residue_embeddings - mean[None, None, :]) / std[None, None, :]
+        projected = torch.matmul(normalized, self.feature_projection.t())
+        scores = (projected * self.position_factors[None, :, :]).sum(dim=(1, 2))
+        return (scores + self.bias).unsqueeze(-1)
+
+
 class Ensemble:
     def __init__(self, models):
         self.models = models
@@ -559,12 +614,12 @@ class Ensemble:
     @torch.no_grad()
     def forward_with_uncertainty(self, sequences):
         outputs = self._call_models(sequences)
-        return outputs.mean(dim=0), outputs.std(dim=0)
+        return outputs.mean(dim=0), outputs.std(dim=0, unbiased=False)
 
     @torch.no_grad()
     def get_ucb(self, sequences, k=0.1):
         outputs = self._call_models(sequences)
-        return outputs.mean(dim=0) + k * outputs.std(dim=0)
+        return outputs.mean(dim=0) + k * outputs.std(dim=0, unbiased=False)
 
     @torch.no_grad()
     def _call_models(self, x):
@@ -593,6 +648,7 @@ class FrozenESMModel:
         tokenizer=None,
         esm=None,
         cache_allowed_sequences=None,
+        enable_dataset_store=False,
         **kwargs,
     ):
         self.args = args
@@ -603,6 +659,10 @@ class FrozenESMModel:
         self.esm_forward_lock = getattr(args, "esm_forward_lock", None)
         self.esm_batch_worker = getattr(args, "esm_batch_worker", None)
         self.esm_in_memory_cache_pool = getattr(args, "esm_in_memory_cache_pool", None)
+        if self.esm_in_memory_cache_pool is None:
+            self.esm_in_memory_cache_pool = SharedInMemoryESMCachePool(
+                storage_dtype=torch.float16
+            )
         from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
@@ -613,46 +673,37 @@ class FrozenESMModel:
 
         embedding_dim = self.esm.config.hidden_size
         self.embedding_dim = embedding_dim
-        if self.esm_in_memory_cache_pool is not None:
-            self.persistent_embedding_cache = self.esm_in_memory_cache_pool.get_cache(
-                model_name=model_name,
-                max_length=self.max_length,
-                representation_name=representation_name,
-                scope="persistent",
-            )
-            self.run_embedding_cache = self.esm_in_memory_cache_pool.get_cache(
-                model_name=model_name,
-                max_length=self.max_length,
-                representation_name=representation_name,
-                scope="run_scoped",
-            )
-        else:
-            self.persistent_embedding_cache = ESMEmbeddingFileCache(
-                model_name=model_name,
-                max_length=self.max_length,
-                representation_name=representation_name,
-                cache_root=get_esm_embedding_cache_path(),
-                max_disk_bytes=0,
-                max_memory_bytes=512 * 1024 * 1024,
-                storage_dtype="float16",
-                eviction_check_interval=256,
-            )
-            self.run_embedding_cache = ESMEmbeddingFileCache(
-                model_name=model_name,
-                max_length=self.max_length,
-                representation_name=representation_name,
-                cache_root=getattr(
-                    args, "esm_run_cache_root", get_esm_embedding_cache_path()
-                ),
-                max_disk_bytes=0,
-                max_memory_bytes=512 * 1024 * 1024,
-                storage_dtype="float16",
-                eviction_check_interval=256,
-            )
+        self.representation_name = representation_name
+        self.model_name = model_name
+        self.persistent_embedding_cache = self.esm_in_memory_cache_pool.get_cache(
+            model_name=model_name,
+            max_length=self.max_length,
+            representation_name=representation_name,
+            scope="persistent",
+        )
         self.cache_enabled = not getattr(args, "disable_esm_cache", False)
         self.cache_allowed_sequences = (
-            set(cache_allowed_sequences) if cache_allowed_sequences is not None else set()
+            set(cache_allowed_sequences) if cache_allowed_sequences is not None else None
         )
+        self.cache_allowed_sequences_ordered = list(
+            getattr(args, "cache_allowed_sequences_ordered", [])
+        )
+        self.dataset_cache_task = getattr(args, "dataset_cache_task", None)
+        self.dataset_fingerprint = (
+            PersistentDatasetRepresentationStore.dataset_fingerprint(
+                self.cache_allowed_sequences_ordered
+            )
+            if self.cache_allowed_sequences_ordered
+            else None
+        )
+        self.dataset_representation_store = (
+            PersistentDatasetRepresentationStore(get_persistent_dataset_store_root())
+            if enable_dataset_store
+            and self.dataset_cache_task is not None
+            and self.dataset_fingerprint is not None
+            else None
+        )
+        self._persistent_store_checked = False
         self.net = None
         self.optimizer = None
         self.loss_func = None
@@ -693,38 +744,103 @@ class FrozenESMModel:
     def _compute_sequence_representations(self, sequences):
         raise NotImplementedError
 
-    def _esm_forward(self, input_ids, attention_mask):
+    def _esm_outputs(self, input_ids, attention_mask, output_hidden_states=False):
         if self.esm_forward_lock is None:
             return self.esm(
                 input_ids=input_ids.to(self.device),
                 attention_mask=attention_mask.to(self.device),
-            ).last_hidden_state
+                output_hidden_states=output_hidden_states,
+            )
 
-        # Keep one shared frozen ESM resident on GPU and serialize only its forward
-        # pass so concurrent seed threads do not duplicate weights or thrash VRAM.
         with self.esm_forward_lock:
             return self.esm(
                 input_ids=input_ids.to(self.device),
                 attention_mask=attention_mask.to(self.device),
-            ).last_hidden_state
+                output_hidden_states=output_hidden_states,
+            )
+
+    def _esm_forward(self, input_ids, attention_mask):
+        return self._esm_outputs(
+            input_ids,
+            attention_mask,
+            output_hidden_states=False,
+        ).last_hidden_state
+
+    def _maybe_preload_persistent_dataset_store(self, sequences):
+        if (
+            self._persistent_store_checked
+            or self.dataset_representation_store is None
+            or not sequences
+        ):
+            return
+        loaded, _ = self.dataset_representation_store.load_many(
+            task=self.dataset_cache_task,
+            model_name=self.model_name,
+            max_length=self.max_length,
+            representation_name=self.representation_name,
+            dataset_fingerprint=self.dataset_fingerprint,
+            sequences=self.cache_allowed_sequences_ordered,
+        )
+        if loaded:
+            self.persistent_embedding_cache.set_many(
+                list(loaded.keys()),
+                list(loaded.values()),
+            )
+        self._persistent_store_checked = True
+
+    def _maybe_write_persistent_dataset_store(self):
+        if (
+            self.dataset_representation_store is None
+            or not self.cache_allowed_sequences_ordered
+            or self.dataset_representation_store.exists(
+                task=self.dataset_cache_task,
+                model_name=self.model_name,
+                max_length=self.max_length,
+                representation_name=self.representation_name,
+                dataset_fingerprint=self.dataset_fingerprint,
+            )
+        ):
+            return
+        loaded, missing = self.persistent_embedding_cache.get_many(
+            self.cache_allowed_sequences_ordered
+        )
+        if missing:
+            return
+        self.dataset_representation_store.write_complete(
+            task=self.dataset_cache_task,
+            model_name=self.model_name,
+            max_length=self.max_length,
+            representation_name=self.representation_name,
+            dataset_fingerprint=self.dataset_fingerprint,
+            ordered_sequences=self.cache_allowed_sequences_ordered,
+            embeddings=[loaded[sequence] for sequence in self.cache_allowed_sequences_ordered],
+            storage_dtype="float16",
+        )
 
     def get_sequence_representations(self, sequences, cache_mode=CacheMode.TRAIN):
+        del cache_mode
         if not sequences:
             return self._compute_sequence_representations(sequences)
         if not self.cache_enabled:
-            return self._compute_sequence_representations(sequences)
-        if cache_mode == FrozenESMModel.CacheMode.EVAL:
             return self._compute_sequence_representations(sequences)
 
         start_time = time.time()
         unique_sequences = list(dict.fromkeys(sequences))
         embeddings_by_sequence = {}
-        persistent_sequences = [
-            sequence for sequence in unique_sequences if sequence in self.cache_allowed_sequences
-        ]
-        run_scoped_sequences = [
-            sequence for sequence in unique_sequences if sequence not in self.cache_allowed_sequences
-        ]
+        if self.cache_allowed_sequences is None:
+            persistent_sequences = list(unique_sequences)
+            non_persistent_sequences = []
+        else:
+            persistent_sequences = [
+                sequence
+                for sequence in unique_sequences
+                if sequence in self.cache_allowed_sequences
+            ]
+            non_persistent_sequences = [
+                sequence
+                for sequence in unique_sequences
+                if sequence not in self.cache_allowed_sequences
+            ]
 
         missing_persistent_sequences = []
         if persistent_sequences:
@@ -732,29 +848,36 @@ class FrozenESMModel:
                 self.persistent_embedding_cache.get_many(persistent_sequences)
             )
         if missing_persistent_sequences:
+            self._maybe_preload_persistent_dataset_store(missing_persistent_sequences)
+            loaded_from_store, missing_persistent_sequences = (
+                self.persistent_embedding_cache.get_many(persistent_sequences)
+            )
+            embeddings_by_sequence.update(loaded_from_store)
+        if missing_persistent_sequences:
+            sequences_to_compute = list(missing_persistent_sequences)
+            if self.cache_allowed_sequences_ordered:
+                _, missing_dataset_sequences = self.persistent_embedding_cache.get_many(
+                    self.cache_allowed_sequences_ordered
+                )
+                if missing_dataset_sequences:
+                    sequences_to_compute = list(missing_dataset_sequences)
             missing_embeddings = self._compute_sequence_representations(
-                missing_persistent_sequences
+                sequences_to_compute
             )
             self.persistent_embedding_cache.set_many(
-                missing_persistent_sequences, missing_embeddings
+                sequences_to_compute, missing_embeddings
             )
-            for sequence, embedding in zip(
-                missing_persistent_sequences, missing_embeddings
-            ):
-                embeddings_by_sequence[sequence] = embedding
+            loaded_persistent_embeddings, missing_persistent_sequences = (
+                self.persistent_embedding_cache.get_many(persistent_sequences)
+            )
+            embeddings_by_sequence.update(loaded_persistent_embeddings)
+            self._maybe_write_persistent_dataset_store()
 
-        missing_run_sequences = []
-        if run_scoped_sequences:
-            run_embeddings, missing_run_sequences = self.run_embedding_cache.get_many(
-                run_scoped_sequences
-            )
-            embeddings_by_sequence.update(run_embeddings)
-        if missing_run_sequences:
+        if non_persistent_sequences:
             missing_embeddings = self._compute_sequence_representations(
-                missing_run_sequences
+                non_persistent_sequences
             )
-            self.run_embedding_cache.set_many(missing_run_sequences, missing_embeddings)
-            for sequence, embedding in zip(missing_run_sequences, missing_embeddings):
+            for sequence, embedding in zip(non_persistent_sequences, missing_embeddings):
                 embeddings_by_sequence[sequence] = embedding
 
         ordered_embeddings = [
@@ -769,7 +892,7 @@ class FrozenESMModel:
                 elapsed,
                 len(unique_sequences),
                 len(persistent_sequences),
-                len(run_scoped_sequences),
+                len(non_persistent_sequences),
             )
         return stacked
 
@@ -1013,6 +1136,7 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
             representation_name="per_residue_embeddings_v1",
             tokenizer=tokenizer,
             esm=esm,
+            enable_dataset_store=True,
             **kwargs,
         )
         self.scaler = StandardScaler()
@@ -1105,6 +1229,393 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
         return torch.from_numpy(predictions).to(self.device)
 
 
+class InterPLMMeanPooledSklearnModel(FrozenESMModel):
+    def __init__(
+        self,
+        seq_length,
+        args,
+        regression_type,
+        tokenizer=None,
+        esm=None,
+        **kwargs,
+    ):
+        self.seq_length = seq_length
+        self.regression_type = regression_type
+        self.interplm_layer = int(args.interplm_layer)
+        self.interplm_repo_id = args.interplm_repo_id
+        self.interplm_normalized = args.interplm_normalized
+        self.sae_token_chunk_size = int(args.sae_token_chunk_size)
+        self._sae = None
+        super().__init__(
+            args,
+            build_net=None,
+            representation_name=build_interplm_representation_name(
+                layer=self.interplm_layer,
+                repo_id=self.interplm_repo_id,
+                normalized=self.interplm_normalized,
+            ),
+            tokenizer=tokenizer,
+            esm=esm,
+            enable_dataset_store=True,
+            **kwargs,
+        )
+        self.scaler = StandardScaler(copy=False)
+        if regression_type == "ridge":
+            self.regressor = Ridge(
+                alpha=args.ridge_alpha,
+                fit_intercept=args.ridge_fit_intercept,
+                solver="lsqr",
+            )
+        elif regression_type == "linear":
+            self.regressor = LinearRegression(
+                fit_intercept=args.ridge_fit_intercept
+            )
+        else:
+            raise ValueError(f"Unsupported regression_type={regression_type}")
+        self._is_fitted = False
+
+    def _get_sae(self):
+        if self._sae is None:
+            shared_pool = getattr(self.args, "interplm_sae_pool", None)
+            if shared_pool is not None:
+                self._sae = shared_pool.get(
+                    plm_layer=self.interplm_layer,
+                    repo_id=self.interplm_repo_id,
+                    normalized=self.interplm_normalized,
+                    device=self.device,
+                )
+            else:
+                self._sae = load_interplm_sae(
+                    plm_layer=self.interplm_layer,
+                    repo_id=self.interplm_repo_id,
+                    normalized=self.interplm_normalized,
+                    map_location=self.device,
+                ).to(self.device)
+                self._sae.eval()
+                for parameter in self._sae.parameters():
+                    parameter.requires_grad = False
+        return self._sae
+
+    def _compute_sequence_representations(self, sequences):
+        if not sequences:
+            sae = self._get_sae()
+            return torch.empty((0, sae.feature_dim), dtype=torch.float32)
+
+        pooled_sequence_embeddings = []
+        batch_size = self.args.proxy_batch_size
+        sae = self._get_sae()
+        for start in range(0, len(sequences), batch_size):
+            batch_sequences = sequences[start : start + batch_size]
+            input_ids, attention_mask = self._tokenize_batch(batch_sequences)
+            attention_mask = attention_mask.to(self.device)
+            with torch.no_grad():
+                outputs = self._esm_outputs(
+                    input_ids,
+                    attention_mask,
+                    output_hidden_states=True,
+                )
+                if outputs.hidden_states is None:
+                    raise RuntimeError("ESM model did not return hidden states.")
+                residue_embeddings = extract_residue_embeddings(
+                    outputs.hidden_states[self.interplm_layer],
+                    attention_mask,
+                    expected_sequence_length=self.seq_length,
+                )
+                batch_embeddings = mean_pool_sae_activations(
+                    sae,
+                    residue_embeddings,
+                    token_chunk_size=self.sae_token_chunk_size,
+                )
+            pooled_sequence_embeddings.append(batch_embeddings.cpu())
+
+        return torch.cat(pooled_sequence_embeddings, dim=0)
+
+    def _build_features(self, sequence_representations):
+        return (
+            sequence_representations.cpu()
+            .numpy()
+            .astype(np.float32, copy=False)
+        )
+
+    def train(self, dataset):
+        train_sequences = normalize_sequences(dataset.train)
+        train_representations = self.get_sequence_representations(train_sequences)
+        train_features = self._build_features(train_representations)
+        train_labels = np.asarray(dataset.train_scores, dtype=np.float32)
+        scaled_train_features = self.scaler.fit_transform(train_features)
+        self.regressor.fit(scaled_train_features, train_labels)
+        self._is_fitted = True
+
+    def get_fitness(self, sequences):
+        if not self._is_fitted:
+            raise RuntimeError("Regressor has not been fitted. Call train() first.")
+        normalized_sequences = normalize_sequences(sequences)
+        sequence_representations = self.get_sequence_representations(
+            normalized_sequences
+        )
+        features = self._build_features(sequence_representations)
+        scaled_features = self.scaler.transform(features)
+        predictions = self.regressor.predict(scaled_features).astype(np.float32)
+        return torch.from_numpy(predictions).to(self.device)
+
+
+class InterPLMLowRankPositionalModel(FrozenESMModel):
+    def __init__(
+        self,
+        seq_length,
+        args,
+        tokenizer=None,
+        esm=None,
+        **kwargs,
+    ):
+        self.seq_length = int(seq_length)
+        self.interplm_layer = int(args.interplm_layer)
+        self.interplm_repo_id = str(args.interplm_repo_id)
+        self.interplm_normalized = bool(args.interplm_normalized)
+        self.sae_token_chunk_size = int(
+            getattr(args, "sae_token_chunk_size", 1024)
+        )
+        self.rank = int(getattr(args, "low_rank_positional_rank", 16))
+        self.low_rank_l2 = float(getattr(args, "low_rank_positional_l2", 1e-4))
+        self.low_rank_input = str(
+            getattr(args, "low_rank_positional_input", "sae")
+        ).strip().lower()
+        if self.low_rank_input not in {"esm", "sae", "esm_sae_concat"}:
+            raise ValueError(
+                f"Unsupported low_rank_positional_input={self.low_rank_input!r}. "
+                "Expected one of: esm, sae, esm_sae_concat."
+            )
+        repr_batch_size = getattr(args, "low_rank_positional_repr_batch_size", None)
+        self.representation_batch_size = int(
+            repr_batch_size if repr_batch_size is not None else args.proxy_batch_size
+        )
+        self._sae = None
+        self._feature_stats_ready = False
+        super().__init__(
+            args,
+            build_net=lambda embedding_dim: LowRankPositionalRegressor(
+                seq_length=self.seq_length,
+                embedding_dim=self._resolve_input_dim(embedding_dim),
+                rank=self.rank,
+            ),
+            representation_name=self._representation_name(),
+            tokenizer=tokenizer,
+            esm=esm,
+            enable_dataset_store=False,
+            **kwargs,
+        )
+        # Keep representations on GPU in the hot path; skip RAM cache traffic.
+        self.cache_enabled = False
+        if self.low_rank_input in {"sae", "esm_sae_concat"}:
+            self.representation_batch_size = min(self.representation_batch_size, 16)
+        low_rank_lr = getattr(args, "low_rank_positional_lr", None)
+        self.optimizer = torch.optim.Adam(
+            self.net.parameters(),
+            lr=float(low_rank_lr if low_rank_lr is not None else args.lr),
+            weight_decay=0.0,
+        )
+
+    def _resolve_input_dim(self, embedding_dim):
+        if self.low_rank_input == "esm":
+            return int(embedding_dim)
+        sae = load_interplm_sae(
+            plm_layer=self.interplm_layer,
+            repo_id=self.interplm_repo_id,
+            normalized=self.interplm_normalized,
+            map_location="cpu",
+        )
+        sae_feature_dim = int(sae.feature_dim)
+        del sae
+        if self.low_rank_input == "sae":
+            return sae_feature_dim
+        return int(embedding_dim) + sae_feature_dim
+
+    def _representation_name(self):
+        base = (
+            "interplm_source_residue_embeddings_v1"
+            if self.low_rank_input == "esm"
+            else (
+                "interplm_source_sae_residue_embeddings_v1"
+                if self.low_rank_input == "sae"
+                else "interplm_source_esm_sae_concat_residue_embeddings_v1"
+            )
+        )
+        return (
+            f"{base}__layer_{self.interplm_layer}"
+            f"__repo_{self.interplm_repo_id.replace('/', '__')}"
+            f"__normalized_{self.interplm_normalized}"
+        )
+
+    def _get_sae(self):
+        if self._sae is None:
+            shared_pool = getattr(self.args, "interplm_sae_pool", None)
+            if shared_pool is not None:
+                self._sae = shared_pool.get(
+                    plm_layer=self.interplm_layer,
+                    repo_id=self.interplm_repo_id,
+                    normalized=self.interplm_normalized,
+                    device=self.device,
+                )
+            else:
+                self._sae = load_interplm_sae(
+                    plm_layer=self.interplm_layer,
+                    repo_id=self.interplm_repo_id,
+                    normalized=self.interplm_normalized,
+                    map_location=self.device,
+                ).to(self.device)
+                self._sae.eval()
+                for parameter in self._sae.parameters():
+                    parameter.requires_grad = False
+        return self._sae
+
+    def _compute_sequence_representations(self, sequences):
+        if not sequences:
+            return torch.empty(
+                (0, self.seq_length, self.net.embedding_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        residue_sequence_embeddings = []
+        batch_size = max(1, int(self.representation_batch_size))
+        start = 0
+        while start < len(sequences):
+            batch_end = min(start + batch_size, len(sequences))
+            batch_sequences = sequences[start:batch_end]
+            try:
+                input_ids, attention_mask = self._tokenize_batch(batch_sequences)
+                attention_mask = attention_mask.to(self.device)
+                with torch.no_grad():
+                    outputs = self._esm_outputs(
+                        input_ids,
+                        attention_mask,
+                        output_hidden_states=True,
+                    )
+                    if outputs.hidden_states is None:
+                        raise RuntimeError("ESM model did not return hidden states.")
+                    batch_embeddings = extract_residue_embeddings(
+                        outputs.hidden_states[self.interplm_layer],
+                        attention_mask,
+                        expected_sequence_length=self.seq_length,
+                    ).to(torch.float32)
+                    if self.low_rank_input in {"sae", "esm_sae_concat"}:
+                        sae = self._get_sae()
+                        batch_n, sequence_length, _ = batch_embeddings.shape
+                        flattened = batch_embeddings.reshape(batch_n * sequence_length, -1)
+                        projected_chunks = []
+                        chunk_size = max(1, int(self.sae_token_chunk_size))
+                        for chunk_start in range(0, flattened.shape[0], chunk_size):
+                            chunk_stop = min(
+                                flattened.shape[0],
+                                chunk_start + chunk_size,
+                            )
+                            projected_chunks.append(
+                                sae.encode(flattened[chunk_start:chunk_stop]).to(
+                                    torch.float32
+                                )
+                            )
+                        sae_embeddings = torch.cat(projected_chunks, dim=0).reshape(
+                            batch_n,
+                            sequence_length,
+                            -1,
+                        )
+                        if self.low_rank_input == "sae":
+                            batch_embeddings = sae_embeddings
+                        else:
+                            batch_embeddings = torch.cat(
+                                [batch_embeddings, sae_embeddings], dim=-1
+                            )
+                residue_sequence_embeddings.append(batch_embeddings)
+                start = batch_end
+            except torch.OutOfMemoryError:
+                if batch_size == 1:
+                    raise
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                batch_size = max(1, batch_size // 2)
+                logger.warning(
+                    "OOM in low-rank positional representation extraction; retrying with micro-batch size=%d",
+                    batch_size,
+                )
+
+        return torch.cat(residue_sequence_embeddings, dim=0)
+
+    def get_data_loader(self, sequences, labels, shuffle):
+        normalized_sequences = normalize_sequences(sequences)
+        labels_tensor = torch.from_numpy(np.asarray(labels, dtype=np.float32)).float()
+        batch_size = max(
+            1,
+            min(int(self.args.proxy_batch_size), int(self.representation_batch_size)),
+        )
+        dataset = SequenceLabelDataset(normalized_sequences, labels_tensor)
+        return torch.utils.data.DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+        )
+
+    @torch.no_grad()
+    def _prepare_feature_stats(self, train_sequences):
+        input_dim = int(getattr(self.net, "embedding_dim", self.embedding_dim))
+        sums = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
+        sums_sq = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
+        total_tokens = 0
+        batch_size = max(1, int(self.representation_batch_size))
+        for start in range(0, len(train_sequences), batch_size):
+            batch_sequences = train_sequences[start : start + batch_size]
+            reps = self.get_sequence_representations(batch_sequences)
+            flat = reps.reshape(-1, reps.shape[-1])
+            sums += flat.sum(dim=0)
+            sums_sq += (flat * flat).sum(dim=0)
+            total_tokens += int(flat.shape[0])
+        if total_tokens < 1:
+            mean = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
+            std = torch.ones(input_dim, dtype=torch.float32, device=self.device)
+        else:
+            mean = sums / float(total_tokens)
+            var = (sums_sq / float(total_tokens)) - mean * mean
+            std = torch.sqrt(torch.clamp(var, min=1e-6))
+        self.net.set_feature_stats(mean, std)
+        self._feature_stats_ready = True
+
+    def compute_loss(self, data):
+        sequences, labels = data
+        sequence_representations = self.get_sequence_representations(
+            list(sequences)
+        )
+        predictions = self.net(sequence_representations).squeeze(-1)
+        labels = labels.to(self.device)
+        mse = F.mse_loss(predictions, labels)
+        reg = self.low_rank_l2 * (
+            torch.sum(self.net.position_factors * self.net.position_factors)
+            + torch.sum(self.net.feature_projection * self.net.feature_projection)
+        )
+        return mse + reg
+
+    def train(self, dataset):
+        self._feature_stats_ready = False
+        train_sequences = normalize_sequences(dataset.train)
+        self._prepare_feature_stats(train_sequences)
+        super().train(dataset)
+
+    def get_fitness(self, sequences):
+        self.net.eval()
+        with torch.no_grad():
+            normalized_sequences = normalize_sequences(sequences)
+            if not normalized_sequences:
+                return torch.empty((0,), dtype=torch.float32, device=self.device)
+            predictions = []
+            batch_size = max(1, int(self.representation_batch_size))
+            for start in range(0, len(normalized_sequences), batch_size):
+                batch_sequences = normalized_sequences[start : start + batch_size]
+                batch_representations = self.get_sequence_representations(
+                    batch_sequences,
+                    cache_mode=FrozenESMModel.CacheMode.EVAL,
+                )
+                predictions.append(self.net(batch_representations).squeeze(-1))
+        return torch.cat(predictions, dim=0)
+
+
 class OneHotSklearnModel:
     def __init__(self, seq_length, args, regression_type):
         self.seq_length = seq_length
@@ -1156,11 +1667,51 @@ class OneHotSklearnModel:
 
 
 def build_surrogate_model(seq_length, args, shared_esm_components=None):
+    tokenizer = None
+    esm = None
+    esm_forward_lock = None
+    esm_batch_worker = None
+    esm_in_memory_cache_pool = None
+    interplm_sae_pool = None
+    if shared_esm_components is not None:
+        if hasattr(shared_esm_components, "tokenizer"):
+            tokenizer = shared_esm_components.tokenizer
+            esm = shared_esm_components.esm
+            esm_forward_lock = getattr(shared_esm_components, "esm_forward_lock", None)
+            esm_batch_worker = getattr(shared_esm_components, "esm_batch_worker", None)
+            esm_in_memory_cache_pool = getattr(
+                shared_esm_components, "esm_in_memory_cache_pool", None
+            )
+            interplm_sae_pool = getattr(shared_esm_components, "interplm_sae_pool", None)
+        elif isinstance(shared_esm_components, tuple):
+            tokenizer, esm = shared_esm_components
+    args.esm_forward_lock = esm_forward_lock
+    args.esm_batch_worker = esm_batch_worker
+    args.esm_in_memory_cache_pool = esm_in_memory_cache_pool
+    args.interplm_sae_pool = interplm_sae_pool
+
     if args.surrogate_arch == "one_hot_ridge":
         return OneHotSklearnModel(
             seq_length,
             args,
             regression_type="ridge",
+        )
+    if args.surrogate_arch == "interplm_mean_pool_ridge":
+        return InterPLMMeanPooledSklearnModel(
+            seq_length,
+            args,
+            regression_type="ridge",
+            tokenizer=tokenizer,
+            esm=esm,
+            cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
+        )
+    if args.surrogate_arch == "interplm_low_rank_positional":
+        return InterPLMLowRankPositionalModel(
+            seq_length,
+            args,
+            tokenizer=tokenizer,
+            esm=esm,
+            cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
         )
 
     if args.surrogate_arch in {
@@ -1170,25 +1721,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
         "frozen_esm_flat_ridge",
         "frozen_esm_flat_ridge_no_onehot",
     }:
-        tokenizer = None
-        esm = None
-        esm_forward_lock = None
-        esm_batch_worker = None
-        esm_in_memory_cache_pool = None
-        if shared_esm_components is not None:
-            if hasattr(shared_esm_components, "tokenizer"):
-                tokenizer = shared_esm_components.tokenizer
-                esm = shared_esm_components.esm
-                esm_forward_lock = getattr(shared_esm_components, "esm_forward_lock", None)
-                esm_batch_worker = getattr(shared_esm_components, "esm_batch_worker", None)
-                esm_in_memory_cache_pool = getattr(
-                    shared_esm_components, "esm_in_memory_cache_pool", None
-                )
-            elif isinstance(shared_esm_components, tuple):
-                tokenizer, esm = shared_esm_components
-        args.esm_forward_lock = esm_forward_lock
-        args.esm_batch_worker = esm_batch_worker
-        args.esm_in_memory_cache_pool = esm_in_memory_cache_pool
         if args.surrogate_arch == "frozen_esm_mlp":
             return FrozenESMMeanPooledModel(
                 args,
@@ -1242,6 +1774,7 @@ class SharedESMComponents:
     esm_forward_lock: object | None = None
     esm_batch_worker: SharedESMBatchWorker | None = None
     esm_in_memory_cache_pool: SharedInMemoryESMCachePool | None = None
+    interplm_sae_pool: SharedInterPLMSAEPool | None = None
 
 
 def prepare_shared_esm_components(args):
@@ -1272,6 +1805,7 @@ def prepare_shared_esm_components(args):
     esm.eval()
     for param in esm.parameters():
         param.requires_grad = False
+    esm_forward_lock = threading.Lock()
     esm_batch_worker = SharedESMBatchWorker(
         tokenizer=tokenizer,
         esm=esm,
@@ -1280,10 +1814,12 @@ def prepare_shared_esm_components(args):
         max_wait_ms=getattr(args, "shared_esm_max_wait_ms", 4.0),
     )
     esm_in_memory_cache_pool = SharedInMemoryESMCachePool(storage_dtype=torch.float16)
+    interplm_sae_pool = SharedInterPLMSAEPool()
     return SharedESMComponents(
         tokenizer=tokenizer,
         esm=esm,
-        esm_forward_lock=None,
+        esm_forward_lock=esm_forward_lock,
         esm_batch_worker=esm_batch_worker,
         esm_in_memory_cache_pool=esm_in_memory_cache_pool,
+        interplm_sae_pool=interplm_sae_pool,
     )

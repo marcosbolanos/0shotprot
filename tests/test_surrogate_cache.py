@@ -11,6 +11,8 @@ import transformers
 import torch.nn as nn
 
 from prospero import surrogate
+from prospero.probe_benchmark.interplm import InterPLMSparseAutoencoder
+from prospero.runners import run_protein, run_variable_k
 
 
 class FakeTokenizer:
@@ -49,14 +51,20 @@ class FakeESM(nn.Module):
         self.config = SimpleNamespace(hidden_size=hidden_size)
         self.forward_call_count = 0
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, output_hidden_states=False):
         del attention_mask
         self.forward_call_count += 1
         offsets = torch.arange(self.config.hidden_size, device=input_ids.device).view(
             1, 1, -1
         )
-        last_hidden_state = input_ids.unsqueeze(-1).float() + offsets
-        return SimpleNamespace(last_hidden_state=last_hidden_state)
+        base_hidden_state = input_ids.unsqueeze(-1).float() + offsets
+        hidden_states = tuple(
+            base_hidden_state + float(layer_index) for layer_index in range(7)
+        )
+        return SimpleNamespace(
+            last_hidden_state=hidden_states[-1],
+            hidden_states=hidden_states if output_hidden_states else None,
+        )
 
 
 def make_args(**overrides):
@@ -94,6 +102,19 @@ def build_model(monkeypatch, tmp_path, **arg_overrides):
     return model, fake_esm
 
 
+def make_fake_sae(input_dim, feature_dim=5):
+    sae = InterPLMSparseAutoencoder(input_dim=input_dim, feature_dim=feature_dim)
+    with torch.no_grad():
+        sae.bias.zero_()
+        sae.encoder.weight.zero_()
+        sae.encoder.bias.zero_()
+        for feature_idx in range(min(input_dim, feature_dim)):
+            sae.encoder.weight[feature_idx, feature_idx] = 1.0
+        sae.decoder.weight.zero_()
+    sae.eval()
+    return sae
+
+
 def build_per_residue_model(monkeypatch, tmp_path, seq_length=5, **arg_overrides):
     fake_esm = FakeESM()
     monkeypatch.setattr(
@@ -122,10 +143,10 @@ def test_cached_embeddings_are_reused(monkeypatch, tmp_path):
     assert fake_esm.forward_call_count == 2
 
     assert first_embeddings.shape == (3, fake_esm.config.hidden_size)
-    assert torch.allclose(first_embeddings, second_embeddings)
-    assert torch.allclose(first_embeddings[0], first_embeddings[2])
+    assert torch.allclose(first_embeddings, second_embeddings, atol=1e-2, rtol=1e-3)
+    assert torch.allclose(first_embeddings[0], first_embeddings[2], atol=1e-2, rtol=1e-3)
     assert predictions.shape == (2,)
-    assert list((tmp_path / "esm_embeddings").rglob("*.pt"))
+    assert not list((tmp_path / "esm_embeddings").rglob("*.pt"))
 
 
 def test_training_uses_cached_embeddings_across_retrains(monkeypatch, tmp_path):
@@ -163,7 +184,7 @@ def test_cached_per_residue_embeddings_are_reused(monkeypatch, tmp_path):
     assert torch.allclose(first_embeddings, second_embeddings)
     assert torch.allclose(first_embeddings[0], first_embeddings[2])
     assert predictions.shape == (2,)
-    assert list((tmp_path / "esm_embeddings").rglob("*.pt"))
+    assert not list((tmp_path / "esm_embeddings").rglob("*.pt"))
 
 
 def test_per_residue_training_uses_cached_embeddings_across_retrains(
@@ -282,7 +303,6 @@ def test_flattened_one_hot_sklearn_surrogate_fit_predict(
 
     assert predictions.shape == (2,)
     assert torch.isfinite(predictions).all()
-    # Cache is disabled for this test, so no embedding payloads should be written.
     assert not list((tmp_path / "esm_embeddings").rglob("*.pt"))
 
 
@@ -295,17 +315,426 @@ def test_eval_path_does_not_write_cache(monkeypatch, tmp_path):
 
 
 def test_training_splits_persistent_and_run_scoped_cache(monkeypatch, tmp_path):
-    run_cache_root = tmp_path / "run_cache"
-    model, _ = build_model(
-        monkeypatch,
-        tmp_path,
-        esm_run_cache_root=str(run_cache_root),
-    )
+    model, fake_esm = build_model(monkeypatch, tmp_path)
     model.cache_allowed_sequences = {"AAA"}
 
     _ = model.get_pooled_sequence_embeddings(["AAA", "BBB"])
+    assert fake_esm.forward_call_count == 2
+    _ = model.get_pooled_sequence_embeddings(["AAA", "BBB"])
 
-    persistent_files = list(model.persistent_embedding_cache.namespace.rglob("*.pt"))
-    run_files = list(model.run_embedding_cache.namespace.rglob("*.pt"))
-    assert len(persistent_files) == 1
-    assert len(run_files) == 1
+    loaded, missing = model.persistent_embedding_cache.get_many(["AAA", "BBB"])
+    assert "AAA" in loaded
+    assert missing == ["BBB"]
+    assert fake_esm.forward_call_count == 3
+
+
+def test_build_surrogate_model_supports_interplm_mean_pool_ridge(
+    monkeypatch, tmp_path
+):
+    fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name: fake_esm,
+    )
+    monkeypatch.setattr(
+        surrogate,
+        "load_interplm_sae",
+        lambda **kwargs: make_fake_sae(input_dim=fake_esm.config.hidden_size),
+    )
+
+    model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="interplm_mean_pool_ridge",
+            interplm_layer=2,
+            interplm_repo_id="fake/interplm",
+            interplm_normalized=True,
+            sae_token_chunk_size=3,
+        ),
+    )
+
+    assert isinstance(model, surrogate.InterPLMMeanPooledSklearnModel)
+    assert model.interplm_layer == 2
+    assert model.dataset_representation_store is None
+
+
+def test_interplm_ridge_surrogate_fit_predict(monkeypatch, tmp_path):
+    fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name: fake_esm,
+    )
+    monkeypatch.setattr(
+        surrogate,
+        "load_interplm_sae",
+        lambda **kwargs: make_fake_sae(input_dim=fake_esm.config.hidden_size),
+    )
+
+    model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="interplm_mean_pool_ridge",
+            interplm_layer=2,
+            interplm_repo_id="fake/interplm",
+            interplm_normalized=False,
+            sae_token_chunk_size=4,
+            disable_esm_cache=True,
+        ),
+    )
+    dataset = SimpleNamespace(
+        train=np.array(["ACDEF", "AAAAC", "CCCCC"], dtype=object),
+        train_scores=np.array([1.0, 2.0, 0.5], dtype=np.float32),
+        valid=np.array(["DDDDE"], dtype=object),
+        valid_scores=np.array([0.2], dtype=np.float32),
+    )
+
+    model.train(dataset)
+    pooled = model.get_sequence_representations(["ACDEF", "DDDDE"])
+    predictions = model.get_fitness(["ACDEF", "DDDDE"])
+
+    assert pooled.shape == (2, 5)
+    assert predictions.shape == (2,)
+    assert torch.isfinite(predictions).all()
+
+
+def test_build_surrogate_model_supports_interplm_low_rank_positional(
+    monkeypatch, tmp_path
+):
+    fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name, **kwargs: fake_esm,
+    )
+    monkeypatch.setattr(
+        surrogate,
+        "load_interplm_sae",
+        lambda **kwargs: make_fake_sae(input_dim=fake_esm.config.hidden_size),
+    )
+
+    model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="interplm_low_rank_positional",
+            interplm_layer=2,
+            interplm_repo_id="fake/interplm",
+            interplm_normalized=True,
+            low_rank_positional_rank=4,
+            low_rank_positional_l2=1e-4,
+            low_rank_positional_input="sae",
+            disable_esm_cache=True,
+        ),
+    )
+
+    assert isinstance(model, surrogate.InterPLMLowRankPositionalModel)
+    assert model.low_rank_input == "sae"
+    assert model.rank == 4
+
+
+def test_interplm_low_rank_positional_fit_predict(monkeypatch, tmp_path):
+    fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name, **kwargs: fake_esm,
+    )
+    monkeypatch.setattr(
+        surrogate,
+        "load_interplm_sae",
+        lambda **kwargs: make_fake_sae(input_dim=fake_esm.config.hidden_size),
+    )
+    model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="interplm_low_rank_positional",
+            interplm_layer=2,
+            interplm_repo_id="fake/interplm",
+            interplm_normalized=False,
+            sae_token_chunk_size=4,
+            low_rank_positional_rank=4,
+            low_rank_positional_l2=1e-4,
+            low_rank_positional_input="sae",
+            num_model_max_epochs=2,
+            patience=2,
+            disable_esm_cache=True,
+        ),
+    )
+    dataset = SimpleNamespace(
+        train=np.array(["ACDEF", "AAAAC", "CCCCC"], dtype=object),
+        train_scores=np.array([1.0, 2.0, 0.5], dtype=np.float32),
+        valid=np.array(["DDDDE"], dtype=object),
+        valid_scores=np.array([0.2], dtype=np.float32),
+    )
+    model.train(dataset)
+    predictions = model.get_fitness(["ACDEF", "DDDDE"])
+
+    assert predictions.shape == (2,)
+    assert torch.isfinite(predictions).all()
+
+
+def test_runner_plumbing_preserves_interplm_configuration(tmp_path):
+    runner_args = SimpleNamespace(
+        task="LGK",
+        alphabet="RANDOM",
+        surrogate_arch="interplm_mean_pool_ridge",
+        min_corruptions=3,
+        max_corruptions=10,
+        esm_cnn_projection_dim=None,
+        esm_cnn_use_layernorm=False,
+        esm_cnn_concat_one_hot=False,
+        esm_model_name="facebook/esm2_t6_8M_UR50D",
+        esm_max_length=None,
+        ridge_alpha=0.01,
+        ridge_fit_intercept=True,
+        interplm_layer=2,
+        interplm_repo_id="Elana/InterPLM-esm2-8m",
+        interplm_normalized=True,
+        sae_token_chunk_size=2048,
+        disable_esm_cache=False,
+        debug_events=False,
+        debug_heartbeat_seconds=15.0,
+    )
+
+    protein_args = run_variable_k._build_protein_args(
+        runner_args=runner_args,
+        batch_dir=tmp_path / "results",
+        n_iters=10,
+        n_queries=8,
+        seed=5,
+    )
+
+    assert protein_args.surrogate_arch == "interplm_mean_pool_ridge"
+    assert protein_args.interplm_layer == 2
+    assert protein_args.interplm_repo_id == "Elana/InterPLM-esm2-8m"
+    assert protein_args.interplm_normalized is True
+    assert protein_args.sae_token_chunk_size == 2048
+    parsed = run_protein.get_parser().parse_args(
+        ["--surrogate_arch", "interplm_mean_pool_ridge", "--interplm_layer", "2"]
+    )
+    assert parsed.surrogate_arch == "interplm_mean_pool_ridge"
+    assert parsed.interplm_layer == 2
+
+
+def test_runner_plumbing_preserves_low_rank_positional_configuration(tmp_path):
+    runner_args = SimpleNamespace(
+        task="LGK",
+        alphabet="RANDOM",
+        surrogate_arch="interplm_low_rank_positional",
+        min_corruptions=3,
+        max_corruptions=10,
+        esm_cnn_projection_dim=None,
+        esm_cnn_use_layernorm=False,
+        esm_cnn_concat_one_hot=False,
+        esm_model_name="facebook/esm2_t6_8M_UR50D",
+        esm_max_length=None,
+        ridge_alpha=0.01,
+        ridge_fit_intercept=True,
+        interplm_layer=2,
+        interplm_repo_id="Elana/InterPLM-esm2-8m",
+        interplm_normalized=True,
+        sae_token_chunk_size=2048,
+        low_rank_positional_rank=12,
+        low_rank_positional_l2=5e-5,
+        low_rank_positional_lr=3e-4,
+        low_rank_positional_repr_batch_size=8,
+        low_rank_positional_input="sae",
+        disable_esm_cache=False,
+        debug_events=False,
+        debug_heartbeat_seconds=15.0,
+    )
+    protein_args = run_variable_k._build_protein_args(
+        runner_args=runner_args,
+        batch_dir=tmp_path / "results",
+        n_iters=10,
+        n_queries=8,
+        seed=5,
+    )
+    assert protein_args.surrogate_arch == "interplm_low_rank_positional"
+    assert protein_args.low_rank_positional_rank == 12
+    assert protein_args.low_rank_positional_l2 == 5e-5
+    assert protein_args.low_rank_positional_lr == 3e-4
+    assert protein_args.low_rank_positional_repr_batch_size == 8
+    assert protein_args.low_rank_positional_input == "sae"
+    assert protein_args.ensemble_size == 1
+    parsed = run_protein.get_parser().parse_args(
+        [
+            "--surrogate_arch",
+            "interplm_low_rank_positional",
+            "--low_rank_positional_rank",
+            "12",
+            "--low_rank_positional_input",
+            "sae",
+        ]
+    )
+    assert parsed.surrogate_arch == "interplm_low_rank_positional"
+    assert parsed.low_rank_positional_rank == 12
+    assert parsed.low_rank_positional_input == "sae"
+
+
+def test_flat_esm_dataset_store_reuses_embeddings_across_model_instances(
+    monkeypatch, tmp_path
+):
+    ordered_sequences = ["ACDEF", "AAAAC", "CCCCC", "DDDDE"]
+    dataset = SimpleNamespace(
+        train=np.array(["ACDEF", "AAAAC", "CCCCC"], dtype=object),
+        train_scores=np.array([1.0, 2.0, 0.5], dtype=np.float32),
+        valid=np.array(["DDDDE"], dtype=object),
+        valid_scores=np.array([0.2], dtype=np.float32),
+    )
+
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name, **kwargs: FakeTokenizer(),
+    )
+
+    first_fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name, **kwargs: first_fake_esm,
+    )
+    first_model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="frozen_esm_flat_ridge",
+            proxy_batch_size=2,
+            cache_allowed_sequences=set(ordered_sequences),
+            cache_allowed_sequences_ordered=ordered_sequences,
+            dataset_cache_task="LGK",
+        ),
+    )
+    first_model.train(dataset)
+    assert first_fake_esm.forward_call_count > 0
+    assert list((tmp_path / "dataset_representations").rglob("representations.npy"))
+
+    second_fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name, **kwargs: second_fake_esm,
+    )
+    second_model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="frozen_esm_flat_ridge",
+            proxy_batch_size=2,
+            cache_allowed_sequences=set(ordered_sequences),
+            cache_allowed_sequences_ordered=ordered_sequences,
+            dataset_cache_task="LGK",
+        ),
+    )
+    second_model.train(dataset)
+
+    assert second_fake_esm.forward_call_count == 0
+
+
+def test_interplm_dataset_store_reuses_embeddings_across_model_instances(
+    monkeypatch, tmp_path
+):
+    ordered_sequences = ["ACDEF", "AAAAC", "CCCCC", "DDDDE"]
+    dataset = SimpleNamespace(
+        train=np.array(["ACDEF", "AAAAC", "CCCCC"], dtype=object),
+        train_scores=np.array([1.0, 2.0, 0.5], dtype=np.float32),
+        valid=np.array(["DDDDE"], dtype=object),
+        valid_scores=np.array([0.2], dtype=np.float32),
+    )
+
+    monkeypatch.setattr(
+        surrogate, "get_esm_embedding_cache_path", lambda: tmp_path / "esm_embeddings"
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        lambda model_name, **kwargs: FakeTokenizer(),
+    )
+    monkeypatch.setattr(
+        surrogate,
+        "load_interplm_sae",
+        lambda **kwargs: make_fake_sae(input_dim=6),
+    )
+
+    first_fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name, **kwargs: first_fake_esm,
+    )
+    first_model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="interplm_mean_pool_ridge",
+            interplm_layer=2,
+            interplm_repo_id="fake/interplm",
+            interplm_normalized=True,
+            sae_token_chunk_size=4,
+            proxy_batch_size=2,
+            cache_allowed_sequences=set(ordered_sequences),
+            cache_allowed_sequences_ordered=ordered_sequences,
+            dataset_cache_task="LGK",
+        ),
+    )
+    first_model.train(dataset)
+    assert first_fake_esm.forward_call_count > 0
+    assert list((tmp_path / "dataset_representations").rglob("representations.npy"))
+
+    second_fake_esm = FakeESM(hidden_size=6)
+    monkeypatch.setattr(
+        transformers.AutoModel,
+        "from_pretrained",
+        lambda model_name, **kwargs: second_fake_esm,
+    )
+    second_model = surrogate.build_surrogate_model(
+        5,
+        make_args(
+            surrogate_arch="interplm_mean_pool_ridge",
+            interplm_layer=2,
+            interplm_repo_id="fake/interplm",
+            interplm_normalized=True,
+            sae_token_chunk_size=4,
+            proxy_batch_size=2,
+            cache_allowed_sequences=set(ordered_sequences),
+            cache_allowed_sequences_ordered=ordered_sequences,
+            dataset_cache_task="LGK",
+        ),
+    )
+    second_model.train(dataset)
+
+    assert second_fake_esm.forward_call_count == 0

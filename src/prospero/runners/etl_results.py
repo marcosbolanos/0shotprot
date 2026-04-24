@@ -3,6 +3,7 @@ import argparse
 import os
 import json
 import pickle
+import re
 
 
 def extract_data(data, n_iter):
@@ -49,9 +50,18 @@ def etl_scores(data, path, n_iters):
     return avg_data
 
 
+SEED_FILENAME_RE = re.compile(r"seed_(\d+)\.pkl$")
+
+
 def get_seed_data(path):
     seed_data = []
-    for item in ["seed_1.pkl", "seed_2.pkl", "seed_3.pkl", "seed_4.pkl", "seed_5.pkl"]:
+    seed_items = []
+    for item in os.listdir(path):
+        match = SEED_FILENAME_RE.match(item)
+        if match is not None:
+            seed_items.append((int(match.group(1)), item))
+
+    for _, item in sorted(seed_items):
         with open(os.path.join(path, item), "rb") as f:
             data = pickle.load(f)
             seed_data.append(data)
@@ -72,6 +82,8 @@ def main():
     args = parser.parse_args()
     task_path = os.path.join(args.results_dirpath, args.task)
     seed_data = get_seed_data(task_path)
+    if not seed_data:
+        raise FileNotFoundError(f"No seed_*.pkl files found in {task_path}")
     etl_scores(seed_data, os.path.join(task_path, "transformed_results.json"), args.n_iters)
 
 
