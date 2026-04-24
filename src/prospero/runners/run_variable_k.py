@@ -633,10 +633,6 @@ def main() -> None:
                     f"up to {args.max_seed_retries} times",
                     flush=True,
                 )
-            print(
-                f"[shared-esm] run cache scope: {run_cache_scope}",
-                flush=True,
-            )
             shared_oracle = None
             if share_oracle:
                 from prospero.landscapes import get_landscape
@@ -647,12 +643,6 @@ def main() -> None:
                 )
                 shared_oracle = ThreadSafeOracle(get_landscape(args.task))
                 print("[shared-oracle] ready", flush=True)
-                if driver_debug_logger is not None:
-                    driver_debug_logger.event(
-                        "safe_enabled",
-                        max_seed_retries=args.max_seed_retries,
-                        retry_backoff_seconds=args.retry_backoff_seconds,
-                    )
             if args.resume_missing_seeds:
                 print(
                     "[resume] enabled: valid existing seed checkpoints will be skipped",
@@ -669,16 +659,6 @@ def main() -> None:
                     max_seed_retries=args.max_seed_retries,
                     retry_backoff_seconds=args.retry_backoff_seconds,
                 )
-            if args.resume_missing_seeds:
-                print(
-                    "[resume] enabled: valid existing seed checkpoints will be skipped",
-                    flush=True,
-                )
-                if driver_debug_logger is not None:
-                    driver_debug_logger.event(
-                        "resume_missing_seeds_enabled",
-                        completed_seeds_by_n_samples=completed_seeds_by_n_samples,
-                    )
             if share_oracle and driver_debug_logger is not None:
                 driver_debug_logger.event(
                     "shared_oracle_ready",
