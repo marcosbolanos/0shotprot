@@ -5,8 +5,10 @@ set -euo pipefail
 # captures runtime/system usage, syncs results to S3, then auto-terminates.
 
 REGION="${AWS_REGION:-eu-west-2}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-g4dn.xlarge}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-g6.2xlarge}"
 INSTANCE_PROFILE_NAME="${INSTANCE_PROFILE_NAME:-s3_access_for_ec2}"
+SUBNET_ID="${SUBNET_ID:-subnet-0189631874fa07cd9}"
+AMI_ID="${AMI_ID:-ami-0ebd4f1bfe8d7d4f9}"
 TASK="${TASK:-D_SHIFT}"
 SURROGATE_ARCH="${SURROGATE_ARCH:-one_hot_ridge}"
 N_SAMPLES="${N_SAMPLES:-8,16,32,64,128}"
@@ -14,15 +16,13 @@ SEEDS="${SEEDS:-1,2,3,4,5}"
 N_ITERS="${N_ITERS:-10}"
 MAX_WORKERS="${MAX_WORKERS:-5}"
 MONITOR_INTERVAL_SECONDS="${MONITOR_INTERVAL_SECONDS:-5}"
-AMI_PARAM="${AMI_PARAM:-/aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id}"
+BUCKET="${BUCKET:-prospero-965220895247-eu-west-2}"
+WAIT_FOR_TERMINATION="${WAIT_FOR_TERMINATION:-1}"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-BUCKET="${BUCKET:-prospero-${ACCOUNT_ID}-${REGION}}"
 TIMESTAMP_UTC="$(date -u +%Y%m%dT%H%M%SZ)"
 S3_PREFIX="${S3_PREFIX:-ec2_variable_k_dshift_one_hot_ridge/${TIMESTAMP_UTC}}"
 S3_URI="s3://${BUCKET}/${S3_PREFIX}"
-
-AMI_ID="$(aws ssm get-parameter --region "${REGION}" --name "${AMI_PARAM}" --query 'Parameter.Value' --output text)"
 
 declare -a CANDIDATE_SUBNETS=()
 
@@ -318,6 +318,7 @@ INSTANCE_ID=""
 SUBNET_ID=""
 for subnet in "${CANDIDATE_SUBNETS[@]}"; do
   echo "Trying subnet ${subnet}..."
+  set +e
   LAUNCH_OUTPUT="$(
     aws ec2 run-instances \
       --region "${REGION}" \
@@ -332,7 +333,9 @@ for subnet in "${CANDIDATE_SUBNETS[@]}"; do
       --query 'Instances[0].InstanceId' \
       --output text 2>&1
   )"
-  if [[ $? -eq 0 ]]; then
+  LAUNCH_RC=$?
+  set -e
+  if [[ ${LAUNCH_RC} -eq 0 ]]; then
     INSTANCE_ID="${LAUNCH_OUTPUT}"
     SUBNET_ID="${subnet}"
     break
@@ -370,17 +373,20 @@ EOF
 
 aws s3 cp "${MANIFEST_FILE}" "${S3_URI}/run_manifest.json"
 
-echo "Waiting for instance to terminate..."
-while true; do
-  INSTANCE_STATE="$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${INSTANCE_ID}" --query 'Reservations[0].Instances[0].State.Name' --output text)"
-  echo "Instance ${INSTANCE_ID} state=${INSTANCE_STATE}"
-  if [[ "${INSTANCE_STATE}" == "terminated" ]]; then
-    break
-  fi
-  sleep 30
-done
-
-echo "Instance terminated."
+if [[ "${WAIT_FOR_TERMINATION}" == "1" ]]; then
+  echo "Waiting for instance to terminate..."
+  while true; do
+    INSTANCE_STATE="$(aws ec2 describe-instances --region "${REGION}" --instance-ids "${INSTANCE_ID}" --query 'Reservations[0].Instances[0].State.Name' --output text)"
+    echo "Instance ${INSTANCE_ID} state=${INSTANCE_STATE}"
+    if [[ "${INSTANCE_STATE}" == "terminated" ]]; then
+      break
+    fi
+    sleep 30
+  done
+  echo "Instance terminated."
+else
+  echo "Launched ${INSTANCE_ID}; skipping wait (WAIT_FOR_TERMINATION=${WAIT_FOR_TERMINATION})."
+fi
 echo "Run manifest: ${S3_URI}/run_manifest.json"
 echo "Results root: ${S3_URI}/results/"
 echo "Logs root: ${S3_URI}/logs/"
