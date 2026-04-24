@@ -17,12 +17,14 @@ N_ITERS="${N_ITERS:-10}"
 MAX_WORKERS="${MAX_WORKERS:-5}"
 MONITOR_INTERVAL_SECONDS="${MONITOR_INTERVAL_SECONDS:-5}"
 BUCKET="${BUCKET:-prospero-965220895247-eu-west-2}"
+ORACLES_S3_PREFIX="${ORACLES_S3_PREFIX:-oracles}"
 WAIT_FOR_TERMINATION="${WAIT_FOR_TERMINATION:-1}"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 TIMESTAMP_UTC="$(date -u +%Y%m%dT%H%M%SZ)"
 S3_PREFIX="${S3_PREFIX:-ec2_variable_k_dshift_one_hot_ridge/${TIMESTAMP_UTC}}"
 S3_URI="s3://${BUCKET}/${S3_PREFIX}"
+ORACLES_S3_URI="s3://${BUCKET}/${ORACLES_S3_PREFIX}"
 
 declare -a CANDIDATE_SUBNETS=()
 
@@ -124,6 +126,18 @@ aws s3 cp "__S3_URI__/source/0shotprot_source.tar.gz" "${WORKDIR}/source.tar.gz"
 mkdir -p repo
 tar -xzf source.tar.gz -C repo
 cd repo
+
+if aws s3 ls "__ORACLES_S3_URI__/" >/dev/null 2>&1; then
+  echo "Syncing oracle assets from __ORACLES_S3_URI__ to ${WORKDIR}/repo/oracles"
+  aws s3 sync "__ORACLES_S3_URI__/" "${WORKDIR}/repo/oracles/"
+else
+  if [[ "__TASK__" == D_SHIFT* ]]; then
+    echo "Oracle assets missing at __ORACLES_S3_URI__; continuing because __TASK__ uses ESMFold oracle."
+  else
+    echo "Oracle assets missing at __ORACLES_S3_URI__; cannot run task __TASK__."
+    exit 2
+  fi
+fi
 
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="outputs/ec2_run_${RUN_TS}"
@@ -288,6 +302,7 @@ mapping = {
     "__N_ITERS__": """N_ITERS_PLACEHOLDER""",
     "__MAX_WORKERS__": """MAX_WORKERS_PLACEHOLDER""",
     "__MONITOR_INTERVAL_SECONDS__": """MONITOR_INTERVAL_PLACEHOLDER""",
+    "__ORACLES_S3_URI__": """ORACLES_S3_URI_PLACEHOLDER""",
 }
 for key, value in mapping.items():
     text = text.replace(key, value)
@@ -308,6 +323,7 @@ text = text.replace("SEEDS_PLACEHOLDER", ${SEEDS@Q})
 text = text.replace("N_ITERS_PLACEHOLDER", ${N_ITERS@Q})
 text = text.replace("MAX_WORKERS_PLACEHOLDER", ${MAX_WORKERS@Q})
 text = text.replace("MONITOR_INTERVAL_PLACEHOLDER", ${MONITOR_INTERVAL_SECONDS@Q})
+text = text.replace("ORACLES_S3_URI_PLACEHOLDER", ${ORACLES_S3_URI@Q})
 path.write_text(text, encoding="utf-8")
 PY
 
@@ -360,6 +376,8 @@ cat > "${MANIFEST_FILE}" <<EOF
   "bucket": "${BUCKET}",
   "s3_prefix": "${S3_PREFIX}",
   "s3_uri": "${S3_URI}",
+  "oracles_s3_prefix": "${ORACLES_S3_PREFIX}",
+  "oracles_s3_uri": "${ORACLES_S3_URI}",
   "task": "${TASK}",
   "surrogate_arch": "${SURROGATE_ARCH}",
   "n_samples": "${N_SAMPLES}",
