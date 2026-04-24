@@ -7,6 +7,8 @@ name = "prospero"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "biotite>=1.0.0",
+    "esm==3.2.3",
     "evodiff>=1.1.0",
     "jaxtyping>=0.3.9",
     "matplotlib>=3.10.8",
@@ -14,11 +16,14 @@ dependencies = [
     "pyright>=1.1.408",
     "pytest>=9.0.2",
     "scikit-learn>=1.8.0",
+    "sentencepiece>=0.2.1",
     "setuptools<82",
     "tape-proteins",
+    "tiktoken>=0.12.0",
     "torch==2.5.1",
     "tqdm>=4.67.3",
-    "transformers>=5.3.0",
+    "transformer-engine>=2.14.0",
+    "transformers>=4.47,<4.48.2",
 ]
 
 [tool.setuptools.packages.find]

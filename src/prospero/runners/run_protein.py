@@ -40,6 +40,7 @@ logging.basicConfig(
 
 FROZEN_ESM_SURROGATE_ARCHS = {
     "interplm_mean_pool_ridge",
+    "interplm_low_rank_positional",
     "frozen_esm_mlp",
     "frozen_esm_cnn",
     "frozen_esm_flat_linear",
@@ -268,6 +269,7 @@ def get_parser():
             "cnn",
             "one_hot_ridge",
             "interplm_mean_pool_ridge",
+            "interplm_low_rank_positional",
             "frozen_esm_mlp",
             "frozen_esm_cnn",
             "frozen_esm_flat_linear",
@@ -280,6 +282,19 @@ def get_parser():
         "--esm_model_name",
         type=str,
         default="facebook/esm2_t6_8M_UR50D",
+    )
+    parser.add_argument(
+        "--hf_trust_remote_code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow loading Hugging Face models/tokenizers with remote custom code.",
+    )
+    parser.add_argument(
+        "--hf_tokenization_mode",
+        type=str,
+        choices=["auto", "raw", "spaced", "split"],
+        default="auto",
+        help="Protein tokenization strategy for universal HF models.",
     )
     parser.add_argument("--esm_mlp_hidden_dim", type=int, default=256)
     parser.add_argument("--esm_mlp_dropout", type=float, default=0.25)
@@ -328,6 +343,34 @@ def get_parser():
         type=int,
         default=1024,
         help="Chunk size for pooling SAE activations over residue tokens.",
+    )
+    parser.add_argument(
+        "--low_rank_positional_rank",
+        type=int,
+        default=16,
+        help="Rank r for interplm_low_rank_positional surrogate.",
+    )
+    parser.add_argument(
+        "--low_rank_positional_l2",
+        type=float,
+        default=1e-4,
+        help="L2 regularization strength on A and B factors.",
+    )
+    parser.add_argument(
+        "--low_rank_positional_lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for interplm_low_rank_positional.",
+    )
+    parser.add_argument(
+        "--low_rank_positional_input",
+        type=str,
+        choices=["esm", "sae", "esm_sae_concat"],
+        default="esm",
+        help=(
+            "Input representation for interplm_low_rank_positional "
+            "(esm, sae, or esm_sae_concat)."
+        ),
     )
     parser.add_argument("--debug-events", action="store_true", default=False)
     parser.add_argument("--debug-heartbeat-seconds", type=float, default=15.0)

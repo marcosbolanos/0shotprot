@@ -12,12 +12,18 @@ def get_parser() -> argparse.ArgumentParser:
         "Single-iteration latent masked search: targeted masking + latent steering"
     )
     parser.add_argument("--top-features", type=int, default=3)
+    parser.add_argument(
+        "--top-feature-counts",
+        type=int,
+        nargs="+",
+        default=[1, 3, 8, 15, 30],
+    )
     parser.add_argument("--steering-layer", type=int, default=2)
     parser.add_argument(
         "--steering-scalars",
         type=float,
         nargs="+",
-        default=[0.2, 0.7, 1.2, 1.8],
+        default=[0.01, 0.02, 0.2, 0.7],
     )
     parser.add_argument("--combo-chunk-size", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=256)
