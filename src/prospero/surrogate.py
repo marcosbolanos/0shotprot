@@ -21,11 +21,6 @@ from .representations.interplm import (
     load_interplm_sae,
     mean_pool_sae_activations,
 )
-from .plm.universal_hf import load_universal_hf_components
-from .plm.universal_hf import infer_hidden_size
-from .plm.universal_hf import tokenize_protein_sequences
-from .plm.evolutionaryscale import EvolutionaryScaleBackend
-from .plm.evolutionaryscale import is_evolutionaryscale_model
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -109,19 +104,14 @@ class SharedESMBatchWorker:
         tokenizer,
         esm,
         device,
-        sequence_backend=None,
         max_batch_sequences=512,
         max_wait_ms=4.0,
     ):
         self.tokenizer = tokenizer
         self.esm = esm
         self.device = device
-        self.sequence_backend = sequence_backend
         self.max_batch_sequences = max(1, int(max_batch_sequences))
         self.max_wait_seconds = max(0.0, float(max_wait_ms) / 1000.0)
-        special_ids_source = tokenizer.all_special_ids if tokenizer is not None else []
-        self.special_token_ids = tuple(int(x) for x in (special_ids_source or []))
-        self.tokenization_mode = "auto"
         self._pending = []
         self._condition = threading.Condition()
         self._closed = False
@@ -244,32 +234,22 @@ class SharedESMBatchWorker:
         all_representations = []
         for start_idx in range(0, len(sequences), self.max_batch_sequences):
             chunk_sequences = sequences[start_idx : start_idx + self.max_batch_sequences]
-            if self.sequence_backend is not None:
-                chunk_representations = self.sequence_backend.compute_representations(
-                    chunk_sequences,
-                    representation_name=first.representation_name,
-                    expected_sequence_length=first.expected_sequence_length,
-                ).cpu()
-                all_representations.append(chunk_representations)
-                continue
+            tokenizer_kwargs = {
+                "return_tensors": "pt",
+                "padding": True,
+                "truncation": first.max_length is not None,
+            }
+            if first.max_length is not None:
+                tokenizer_kwargs["max_length"] = first.max_length
 
-            encoded = tokenize_protein_sequences(
-                self.tokenizer,
-                chunk_sequences,
-                max_length=first.max_length,
-                mode=self.tokenization_mode,
-            )
-            self.tokenization_mode = encoded["tokenization_mode"]
+            encoded = self.tokenizer(chunk_sequences, **tokenizer_kwargs)
             input_ids = encoded["input_ids"]
             attention_mask = encoded["attention_mask"]
             with torch.no_grad():
-                sequence_outputs = forward_hidden_state_model(
-                    self.esm,
+                sequence_embeddings = self.esm(
                     input_ids=input_ids.to(self.device),
                     attention_mask=attention_mask.to(self.device),
-                    output_hidden_states=True,
-                )
-                sequence_embeddings = get_last_hidden_state(sequence_outputs)
+                ).last_hidden_state
                 if first.representation_name == "mean_pool_residue_embeddings_v1":
                     chunk_representations = mean_pool_residue_embeddings(
                         sequence_embeddings, attention_mask.to(self.device)
@@ -279,8 +259,6 @@ class SharedESMBatchWorker:
                         sequence_embeddings,
                         attention_mask.to(self.device),
                         expected_sequence_length=first.expected_sequence_length,
-                        input_ids=input_ids.to(self.device),
-                        special_token_ids=self.special_token_ids,
                     ).cpu()
                 else:
                     raise ValueError(
@@ -342,73 +320,13 @@ def mean_pool_residue_embeddings(sequence_embeddings, attention_mask):
     return pooled_embeddings / residue_mask.sum(dim=1).clamp(min=1.0)
 
 
-def get_last_hidden_state(outputs):
-    if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-        return outputs.last_hidden_state
-    if hasattr(outputs, "hidden_states") and outputs.hidden_states:
-        return outputs.hidden_states[-1]
-    if isinstance(outputs, tuple) and outputs and torch.is_tensor(outputs[0]):
-        return outputs[0]
-    if hasattr(outputs, "keys"):
-        for key in outputs.keys():
-            value = outputs[key]
-            if torch.is_tensor(value) and value.dim() >= 3:
-                return value
-    raise ValueError("Unable to extract last hidden state from model outputs.")
-
-
-def forward_hidden_state_model(model, input_ids, attention_mask, output_hidden_states=False):
-    is_encoder_decoder = bool(getattr(getattr(model, "config", None), "is_encoder_decoder", False))
-    if is_encoder_decoder:
-        encoder = getattr(model, "encoder", None)
-        if encoder is None and hasattr(model, "get_encoder"):
-            encoder = model.get_encoder()
-        if encoder is not None:
-            return encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=output_hidden_states,
-                return_dict=True,
-            )
-    return model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=output_hidden_states,
-        return_dict=True,
-    )
-
-
 def extract_residue_embeddings(
-    sequence_embeddings,
-    attention_mask,
-    expected_sequence_length=None,
-    input_ids=None,
-    special_token_ids=None,
-    tokenizer=None,
+    sequence_embeddings, attention_mask, expected_sequence_length=None
 ):
-    if special_token_ids is None and tokenizer is not None:
-        special_token_ids = set(int(x) for x in (tokenizer.all_special_ids or []))
-    elif special_token_ids is not None:
-        special_token_ids = set(int(x) for x in special_token_ids)
-
     residue_embeddings = []
-    for row_idx, (embedding, mask) in enumerate(zip(sequence_embeddings, attention_mask)):
-        residues = None
-        if input_ids is not None and special_token_ids is not None:
-            valid_positions = torch.nonzero(mask.bool(), as_tuple=False).squeeze(-1)
-            token_ids = input_ids[row_idx, valid_positions]
-            keep_mask = torch.tensor(
-                [int(tok_id.item()) not in special_token_ids for tok_id in token_ids],
-                device=valid_positions.device,
-                dtype=torch.bool,
-            )
-            kept_positions = valid_positions[keep_mask]
-            if kept_positions.numel() > 0:
-                residues = embedding[kept_positions]
-
-        if residues is None:
-            residue_count = int(mask.sum().item()) - 2
-            residues = embedding[1 : residue_count + 1]
+    for embedding, mask in zip(sequence_embeddings, attention_mask):
+        residue_count = int(mask.sum().item()) - 2
+        residues = embedding[1 : residue_count + 1]
         if (
             expected_sequence_length is not None
             and residues.shape[0] != expected_sequence_length
@@ -432,8 +350,8 @@ def extract_residue_embeddings(
     reference_length = expected_sequence_length or residue_embeddings[0].shape[0]
     if any(residues.shape[0] != reference_length for residues in residue_embeddings):
         raise ValueError(
-                "Per-residue ESM CNN expects all sequences in a batch to have the "
-                "same residue length."
+            "Per-residue ESM CNN expects all sequences in a batch to have the "
+            "same residue length."
         )
     return torch.stack(residue_embeddings, dim=0)
 
@@ -655,16 +573,27 @@ class LowRankPositionalRegressor(nn.Module):
 
     @torch.no_grad()
     def set_feature_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
-        mean = mean.to(device=self.feature_mean.device, dtype=self.feature_mean.dtype)
-        std = std.to(device=self.feature_std.device, dtype=self.feature_std.dtype)
-        self.feature_mean.copy_(mean)
-        self.feature_std.copy_(torch.clamp(std, min=1e-6))
+        self.feature_mean.copy_(
+            mean.to(
+                device=self.feature_mean.device,
+                dtype=self.feature_mean.dtype,
+            )
+        )
+        self.feature_std.copy_(
+            torch.clamp(
+                std.to(
+                    device=self.feature_std.device,
+                    dtype=self.feature_std.dtype,
+                ),
+                min=1e-6,
+            )
+        )
 
     def forward(self, residue_embeddings: torch.Tensor) -> torch.Tensor:
-        z = (residue_embeddings - self.feature_mean[None, None, :]) / self.feature_std[
-            None, None, :
-        ]
-        projected = torch.einsum("bld,rd->blr", z, self.feature_projection)
+        mean = self.feature_mean.to(residue_embeddings.dtype)
+        std = self.feature_std.to(residue_embeddings.dtype)
+        normalized = (residue_embeddings - mean[None, None, :]) / std[None, None, :]
+        projected = torch.matmul(normalized, self.feature_projection.t())
         scores = (projected * self.position_factors[None, :, :]).sum(dim=(1, 2))
         return (scores + self.bias).unsqueeze(-1)
 
@@ -718,7 +647,6 @@ class FrozenESMModel:
         build_net=None,
         tokenizer=None,
         esm=None,
-        sequence_backend=None,
         cache_allowed_sequences=None,
         enable_dataset_store=False,
         **kwargs,
@@ -737,28 +665,16 @@ class FrozenESMModel:
             )
         from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
 
-        self.sequence_backend = sequence_backend or getattr(args, "esm_sequence_backend", None)
-        if self.sequence_backend is None:
-            self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
-            self.esm = (esm or AutoModel.from_pretrained(model_name)).to(self.device)
-            self.esm.eval()
-            for param in self.esm.parameters():
-                param.requires_grad = False
-            embedding_dim = infer_hidden_size(self.esm.config)
-        else:
-            self.tokenizer = tokenizer
-            self.esm = esm
-            embedding_dim = int(self.sequence_backend.hidden_size)
+        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
+        self.esm = (esm or AutoModel.from_pretrained(model_name)).to(self.device)
+        self.esm.eval()
+        for param in self.esm.parameters():
+            param.requires_grad = False
+
+        embedding_dim = self.esm.config.hidden_size
         self.embedding_dim = embedding_dim
         self.representation_name = representation_name
         self.model_name = model_name
-        special_ids_source = (
-            self.tokenizer.all_special_ids
-            if self.tokenizer is not None and hasattr(self.tokenizer, "all_special_ids")
-            else []
-        )
-        self.special_token_ids = tuple(int(x) for x in (special_ids_source or []))
-        self.tokenization_mode = getattr(args, "hf_tokenization_mode", "auto")
         self.persistent_embedding_cache = self.esm_in_memory_cache_pool.get_cache(
             model_name=model_name,
             max_length=self.max_length,
@@ -815,52 +731,40 @@ class FrozenESMModel:
         return loader
 
     def _tokenize_batch(self, sequences):
-        if self.sequence_backend is not None:
-            raise RuntimeError(
-                "_tokenize_batch should not be called when using EvolutionaryScale backend."
-            )
-        encoded = tokenize_protein_sequences(
-            self.tokenizer,
-            list(sequences),
-            max_length=self.max_length,
-            mode=self.tokenization_mode,
-        )
-        self.tokenization_mode = encoded["tokenization_mode"]
+        tokenizer_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+            "truncation": self.max_length is not None,
+        }
+        if self.max_length is not None:
+            tokenizer_kwargs["max_length"] = self.max_length
+        encoded = self.tokenizer(sequences, **tokenizer_kwargs)
         return encoded["input_ids"], encoded["attention_mask"]
 
     def _compute_sequence_representations(self, sequences):
         raise NotImplementedError
 
     def _esm_outputs(self, input_ids, attention_mask, output_hidden_states=False):
-        if self.sequence_backend is not None:
-            raise RuntimeError(
-                "_esm_outputs should not be called when using EvolutionaryScale backend."
-            )
-        model_input_ids = input_ids.to(self.device)
-        model_attention_mask = attention_mask.to(self.device)
         if self.esm_forward_lock is None:
-            return forward_hidden_state_model(
-                self.esm,
-                input_ids=model_input_ids,
-                attention_mask=model_attention_mask,
+            return self.esm(
+                input_ids=input_ids.to(self.device),
+                attention_mask=attention_mask.to(self.device),
                 output_hidden_states=output_hidden_states,
             )
 
         with self.esm_forward_lock:
-            return forward_hidden_state_model(
-                self.esm,
-                input_ids=model_input_ids,
-                attention_mask=model_attention_mask,
+            return self.esm(
+                input_ids=input_ids.to(self.device),
+                attention_mask=attention_mask.to(self.device),
                 output_hidden_states=output_hidden_states,
             )
 
     def _esm_forward(self, input_ids, attention_mask):
-        outputs = self._esm_outputs(
+        return self._esm_outputs(
             input_ids,
             attention_mask,
-            output_hidden_states=True,
-        )
-        return get_last_hidden_state(outputs)
+            output_hidden_states=False,
+        ).last_hidden_state
 
     def _maybe_preload_persistent_dataset_store(self, sequences):
         if (
@@ -974,10 +878,7 @@ class FrozenESMModel:
                 non_persistent_sequences
             )
             for sequence, embedding in zip(non_persistent_sequences, missing_embeddings):
-                # Keep cache assembly device-consistent with persistent cache values (CPU).
-                embeddings_by_sequence[sequence] = (
-                    embedding.detach().cpu().to(torch.float32)
-                )
+                embeddings_by_sequence[sequence] = embedding
 
         ordered_embeddings = [
             embeddings_by_sequence[sequence] for sequence in sequences
@@ -1092,12 +993,6 @@ class FrozenESMMeanPooledModel(FrozenESMModel):
         if not sequences:
             return torch.empty((0, self.embedding_dim), dtype=torch.float32)
 
-        if self.sequence_backend is not None:
-            return self.sequence_backend.compute_representations(
-                sequences,
-                representation_name="mean_pool_residue_embeddings_v1",
-            )
-
         if self.esm_batch_worker is not None:
             return self.esm_batch_worker.compute(
                 sequences=sequences,
@@ -1156,13 +1051,6 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
                 (0, self.seq_length, self.embedding_dim), dtype=torch.float32
             )
 
-        if self.sequence_backend is not None:
-            return self.sequence_backend.compute_representations(
-                sequences,
-                representation_name="per_residue_embeddings_v1",
-                expected_sequence_length=self.seq_length,
-            )
-
         if self.esm_batch_worker is not None:
             return self.esm_batch_worker.compute(
                 sequences=sequences,
@@ -1183,8 +1071,6 @@ class FrozenESMPerResidueCNNModel(FrozenESMModel):
                     sequence_embeddings,
                     attention_mask,
                     expected_sequence_length=self.seq_length,
-                    input_ids=input_ids.to(self.device),
-                    tokenizer=self.tokenizer,
                 )
             residue_sequence_embeddings.append(batch_embeddings.cpu())
 
@@ -1258,7 +1144,6 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
             self.regressor = Ridge(
                 alpha=args.ridge_alpha,
                 fit_intercept=args.ridge_fit_intercept,
-                solver="lsqr",
             )
         elif regression_type == "linear":
             self.regressor = LinearRegression(
@@ -1272,13 +1157,6 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
         if not sequences:
             return torch.empty(
                 (0, self.seq_length, self.embedding_dim), dtype=torch.float32
-            )
-
-        if self.sequence_backend is not None:
-            return self.sequence_backend.compute_representations(
-                sequences,
-                representation_name="per_residue_embeddings_v1",
-                expected_sequence_length=self.seq_length,
             )
 
         if self.esm_batch_worker is not None:
@@ -1301,8 +1179,6 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
                     sequence_embeddings,
                     attention_mask,
                     expected_sequence_length=self.seq_length,
-                    input_ids=input_ids.to(self.device),
-                    tokenizer=self.tokenizer,
                 )
             residue_sequence_embeddings.append(batch_embeddings.cpu())
 
@@ -1335,9 +1211,7 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
         train_features = self._build_features(train_representations, train_sequences)
         train_labels = np.asarray(dataset.train_scores, dtype=np.float32)
 
-        scaled_train_features = self.scaler.fit_transform(train_features).astype(
-            np.float32, copy=False
-        )
+        scaled_train_features = self.scaler.fit_transform(train_features)
         self.regressor.fit(scaled_train_features, train_labels)
         self._is_fitted = True
 
@@ -1350,7 +1224,7 @@ class FrozenESMFlattenedOneHotSklearnModel(FrozenESMModel):
             normalized_sequences
         )
         features = self._build_features(sequence_representations, normalized_sequences)
-        scaled_features = self.scaler.transform(features).astype(np.float32, copy=False)
+        scaled_features = self.scaler.transform(features)
         predictions = self.regressor.predict(scaled_features).astype(np.float32)
         return torch.from_numpy(predictions).to(self.device)
 
@@ -1372,11 +1246,6 @@ class InterPLMMeanPooledSklearnModel(FrozenESMModel):
         self.interplm_normalized = args.interplm_normalized
         self.sae_token_chunk_size = int(args.sae_token_chunk_size)
         self._sae = None
-        if is_evolutionaryscale_model(args.esm_model_name):
-            raise ValueError(
-                "interplm_mean_pool_ridge requires ESM2 hidden states and is not "
-                "supported with EvolutionaryScale ESM3/ESMC models."
-            )
         super().__init__(
             args,
             build_net=None,
@@ -1451,8 +1320,6 @@ class InterPLMMeanPooledSklearnModel(FrozenESMModel):
                     outputs.hidden_states[self.interplm_layer],
                     attention_mask,
                     expected_sequence_length=self.seq_length,
-                    input_ids=input_ids.to(self.device),
-                    tokenizer=self.tokenizer,
                 )
                 batch_embeddings = mean_pool_sae_activations(
                     sae,
@@ -1502,88 +1369,81 @@ class InterPLMLowRankPositionalModel(FrozenESMModel):
         **kwargs,
     ):
         self.seq_length = int(seq_length)
-        if is_evolutionaryscale_model(args.esm_model_name):
-            raise ValueError(
-                "interplm_low_rank_positional requires ESM2 hidden states and is "
-                "not supported with EvolutionaryScale ESM3/ESMC models."
-            )
         self.interplm_layer = int(args.interplm_layer)
         self.interplm_repo_id = str(args.interplm_repo_id)
         self.interplm_normalized = bool(args.interplm_normalized)
-        self.sae_token_chunk_size = int(args.sae_token_chunk_size)
+        self.sae_token_chunk_size = int(
+            getattr(args, "sae_token_chunk_size", 1024)
+        )
         self.rank = int(getattr(args, "low_rank_positional_rank", 16))
         self.low_rank_l2 = float(getattr(args, "low_rank_positional_l2", 1e-4))
-        self.representation_batch_size = int(
-            getattr(args, "low_rank_positional_repr_batch_size", args.proxy_batch_size)
-        )
         self.low_rank_input = str(
-            getattr(args, "low_rank_positional_input", "esm")
+            getattr(args, "low_rank_positional_input", "sae")
         ).strip().lower()
         if self.low_rank_input not in {"esm", "sae", "esm_sae_concat"}:
             raise ValueError(
                 f"Unsupported low_rank_positional_input={self.low_rank_input!r}. "
                 "Expected one of: esm, sae, esm_sae_concat."
             )
+        repr_batch_size = getattr(args, "low_rank_positional_repr_batch_size", None)
+        self.representation_batch_size = int(
+            repr_batch_size if repr_batch_size is not None else args.proxy_batch_size
+        )
         self._sae = None
-        sae_feature_dim = None
-        if self.low_rank_input in {"sae", "esm_sae_concat"}:
-            sae = load_interplm_sae(
-                plm_layer=self.interplm_layer,
-                repo_id=self.interplm_repo_id,
-                normalized=self.interplm_normalized,
-                map_location="cpu",
-            )
-            sae_feature_dim = int(sae.feature_dim)
-            del sae
         self._feature_stats_ready = False
         super().__init__(
             args,
             build_net=lambda embedding_dim: LowRankPositionalRegressor(
                 seq_length=self.seq_length,
-                embedding_dim=(
-                    int(sae_feature_dim)
-                    if self.low_rank_input == "sae"
-                    else (
-                        int(embedding_dim) + int(sae_feature_dim)
-                        if self.low_rank_input == "esm_sae_concat"
-                        else int(embedding_dim)
-                    )
-                ),
+                embedding_dim=self._resolve_input_dim(embedding_dim),
                 rank=self.rank,
             ),
-            representation_name=(
-                f"interplm_source_residue_embeddings_v1__layer_{self.interplm_layer}"
-                if self.low_rank_input == "esm"
-                else (
-                    (
-                        f"interplm_source_sae_residue_embeddings_v1__layer_{self.interplm_layer}"
-                        f"__repo_{self.interplm_repo_id.replace('/', '__')}"
-                        f"__normalized_{self.interplm_normalized}"
-                    )
-                    if self.low_rank_input == "sae"
-                    else (
-                        f"interplm_source_esm_sae_concat_residue_embeddings_v1__layer_{self.interplm_layer}"
-                        f"__repo_{self.interplm_repo_id.replace('/', '__')}"
-                        f"__normalized_{self.interplm_normalized}"
-                    )
-                )
-            ),
+            representation_name=self._representation_name(),
             tokenizer=tokenizer,
             esm=esm,
-            enable_dataset_store=(self.low_rank_input == "esm"),
+            enable_dataset_store=False,
             **kwargs,
         )
-        # Keep low-rank positional representations on-device to avoid CPU<->GPU
-        # transfer bottlenecks in the hot path.
+        # Keep representations on GPU in the hot path; skip RAM cache traffic.
         self.cache_enabled = False
         if self.low_rank_input in {"sae", "esm_sae_concat"}:
-            # SAE-based inputs are high dimensional; use smaller micro-batches for
-            # representation extraction to avoid OOM while keeping tensors on GPU.
             self.representation_batch_size = min(self.representation_batch_size, 16)
+        low_rank_lr = getattr(args, "low_rank_positional_lr", None)
         self.optimizer = torch.optim.Adam(
             self.net.parameters(),
-            lr=float(getattr(args, "low_rank_positional_lr", args.lr)),
+            lr=float(low_rank_lr if low_rank_lr is not None else args.lr),
             weight_decay=0.0,
+        )
+
+    def _resolve_input_dim(self, embedding_dim):
+        if self.low_rank_input == "esm":
+            return int(embedding_dim)
+        sae = load_interplm_sae(
+            plm_layer=self.interplm_layer,
+            repo_id=self.interplm_repo_id,
+            normalized=self.interplm_normalized,
+            map_location="cpu",
+        )
+        sae_feature_dim = int(sae.feature_dim)
+        del sae
+        if self.low_rank_input == "sae":
+            return sae_feature_dim
+        return int(embedding_dim) + sae_feature_dim
+
+    def _representation_name(self):
+        base = (
+            "interplm_source_residue_embeddings_v1"
+            if self.low_rank_input == "esm"
+            else (
+                "interplm_source_sae_residue_embeddings_v1"
+                if self.low_rank_input == "sae"
+                else "interplm_source_esm_sae_concat_residue_embeddings_v1"
+            )
+        )
+        return (
+            f"{base}__layer_{self.interplm_layer}"
+            f"__repo_{self.interplm_repo_id.replace('/', '__')}"
+            f"__normalized_{self.interplm_normalized}"
         )
 
     def _get_sae(self):
@@ -1647,9 +1507,14 @@ class InterPLMLowRankPositionalModel(FrozenESMModel):
                         projected_chunks = []
                         chunk_size = max(1, int(self.sae_token_chunk_size))
                         for chunk_start in range(0, flattened.shape[0], chunk_size):
-                            chunk_stop = min(flattened.shape[0], chunk_start + chunk_size)
+                            chunk_stop = min(
+                                flattened.shape[0],
+                                chunk_start + chunk_size,
+                            )
                             projected_chunks.append(
-                                sae.encode(flattened[chunk_start:chunk_stop]).to(torch.float32)
+                                sae.encode(flattened[chunk_start:chunk_stop]).to(
+                                    torch.float32
+                                )
                             )
                         sae_embeddings = torch.cat(projected_chunks, dim=0).reshape(
                             batch_n,
@@ -1667,10 +1532,11 @@ class InterPLMLowRankPositionalModel(FrozenESMModel):
             except torch.OutOfMemoryError:
                 if batch_size == 1:
                     raise
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 batch_size = max(1, batch_size // 2)
                 logger.warning(
-                    "OOM in sequence representation extraction; retrying with micro-batch size=%d",
+                    "OOM in low-rank positional representation extraction; retrying with micro-batch size=%d",
                     batch_size,
                 )
 
@@ -1679,20 +1545,24 @@ class InterPLMLowRankPositionalModel(FrozenESMModel):
     def get_data_loader(self, sequences, labels, shuffle):
         normalized_sequences = normalize_sequences(sequences)
         labels_tensor = torch.from_numpy(np.asarray(labels, dtype=np.float32)).float()
+        batch_size = max(
+            1,
+            min(int(self.args.proxy_batch_size), int(self.representation_batch_size)),
+        )
         dataset = SequenceLabelDataset(normalized_sequences, labels_tensor)
         return torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=self.args.proxy_batch_size, shuffle=shuffle
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
         )
 
     @torch.no_grad()
     def _prepare_feature_stats(self, train_sequences):
-        if self._feature_stats_ready:
-            return
         input_dim = int(getattr(self.net, "embedding_dim", self.embedding_dim))
         sums = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
         sums_sq = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
         total_tokens = 0
-        batch_size = self.args.proxy_batch_size
+        batch_size = max(1, int(self.representation_batch_size))
         for start in range(0, len(train_sequences), batch_size):
             batch_sequences = train_sequences[start : start + batch_size]
             reps = self.get_sequence_representations(batch_sequences)
@@ -1700,7 +1570,6 @@ class InterPLMLowRankPositionalModel(FrozenESMModel):
             sums += flat.sum(dim=0)
             sums_sq += (flat * flat).sum(dim=0)
             total_tokens += int(flat.shape[0])
-
         if total_tokens < 1:
             mean = torch.zeros(input_dim, dtype=torch.float32, device=self.device)
             std = torch.ones(input_dim, dtype=torch.float32, device=self.device)
@@ -1713,8 +1582,10 @@ class InterPLMLowRankPositionalModel(FrozenESMModel):
 
     def compute_loss(self, data):
         sequences, labels = data
-        sequence_representations = self.get_sequence_representations(list(sequences))
-        predictions = self.net(sequence_representations.to(self.device)).squeeze(-1)
+        sequence_representations = self.get_sequence_representations(
+            list(sequences)
+        )
+        predictions = self.net(sequence_representations).squeeze(-1)
         labels = labels.to(self.device)
         mse = F.mse_loss(predictions, labels)
         reg = self.low_rank_l2 * (
@@ -1724,6 +1595,7 @@ class InterPLMLowRankPositionalModel(FrozenESMModel):
         return mse + reg
 
     def train(self, dataset):
+        self._feature_stats_ready = False
         train_sequences = normalize_sequences(dataset.train)
         self._prepare_feature_stats(train_sequences)
         super().train(dataset)
@@ -1734,17 +1606,15 @@ class InterPLMLowRankPositionalModel(FrozenESMModel):
             normalized_sequences = normalize_sequences(sequences)
             if not normalized_sequences:
                 return torch.empty((0,), dtype=torch.float32, device=self.device)
-
             predictions = []
-            batch_size = self.args.proxy_batch_size
+            batch_size = max(1, int(self.representation_batch_size))
             for start in range(0, len(normalized_sequences), batch_size):
                 batch_sequences = normalized_sequences[start : start + batch_size]
                 batch_representations = self.get_sequence_representations(
                     batch_sequences,
                     cache_mode=FrozenESMModel.CacheMode.EVAL,
                 )
-                batch_predictions = self.net(batch_representations.to(self.device)).squeeze(-1)
-                predictions.append(batch_predictions)
+                predictions.append(self.net(batch_representations).squeeze(-1))
         return torch.cat(predictions, dim=0)
 
 
@@ -1801,7 +1671,6 @@ class OneHotSklearnModel:
 def build_surrogate_model(seq_length, args, shared_esm_components=None):
     tokenizer = None
     esm = None
-    sequence_backend = None
     esm_forward_lock = None
     esm_batch_worker = None
     esm_in_memory_cache_pool = None
@@ -1810,7 +1679,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
         if hasattr(shared_esm_components, "tokenizer"):
             tokenizer = shared_esm_components.tokenizer
             esm = shared_esm_components.esm
-            sequence_backend = getattr(shared_esm_components, "sequence_backend", None)
             esm_forward_lock = getattr(shared_esm_components, "esm_forward_lock", None)
             esm_batch_worker = getattr(shared_esm_components, "esm_batch_worker", None)
             esm_in_memory_cache_pool = getattr(
@@ -1823,7 +1691,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
     args.esm_batch_worker = esm_batch_worker
     args.esm_in_memory_cache_pool = esm_in_memory_cache_pool
     args.interplm_sae_pool = interplm_sae_pool
-    args.esm_sequence_backend = sequence_backend
 
     if args.surrogate_arch == "one_hot_ridge":
         return OneHotSklearnModel(
@@ -1861,7 +1728,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
                 args,
                 tokenizer=tokenizer,
                 esm=esm,
-                sequence_backend=sequence_backend,
                 cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
             )
         if args.surrogate_arch == "frozen_esm_flat_linear":
@@ -1871,7 +1737,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
                 regression_type="linear",
                 tokenizer=tokenizer,
                 esm=esm,
-                sequence_backend=sequence_backend,
                 cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
             )
         if args.surrogate_arch == "frozen_esm_flat_ridge":
@@ -1882,7 +1747,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
                 include_one_hot=True,
                 tokenizer=tokenizer,
                 esm=esm,
-                sequence_backend=sequence_backend,
                 cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
             )
         if args.surrogate_arch == "frozen_esm_flat_ridge_no_onehot":
@@ -1893,7 +1757,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
                 include_one_hot=False,
                 tokenizer=tokenizer,
                 esm=esm,
-                sequence_backend=sequence_backend,
                 cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
             )
         return FrozenESMPerResidueCNNModel(
@@ -1901,7 +1764,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
             args,
             tokenizer=tokenizer,
             esm=esm,
-            sequence_backend=sequence_backend,
             cache_allowed_sequences=getattr(args, "cache_allowed_sequences", set()),
         )
     return ConvolutionalNetworkModel(seq_length, args)
@@ -1911,7 +1773,6 @@ def build_surrogate_model(seq_length, args, shared_esm_components=None):
 class SharedESMComponents:
     tokenizer: object
     esm: object
-    sequence_backend: object | None = None
     esm_forward_lock: object | None = None
     esm_batch_worker: SharedESMBatchWorker | None = None
     esm_in_memory_cache_pool: SharedInMemoryESMCachePool | None = None
@@ -1919,60 +1780,46 @@ class SharedESMComponents:
 
 
 def prepare_shared_esm_components(args):
+    from transformers import AutoModel, AutoTokenizer  # type: ignore[reportMissingImports]
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    sequence_backend = None
-    if is_evolutionaryscale_model(args.esm_model_name):
-        print(f"[shared-evo] loading model={args.esm_model_name}", flush=True)
-        sequence_backend = EvolutionaryScaleBackend.load(
+    print("[shared-esm] loading tokenizer from local cache", flush=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
             args.esm_model_name,
-            device=device,
+            local_files_only=True,
         )
-        tokenizer = None
-        esm = None
-        esm_forward_lock = None
-        esm_batch_worker = SharedESMBatchWorker(
-            tokenizer=None,
-            esm=None,
-            device=device,
-            sequence_backend=sequence_backend,
-            max_batch_sequences=getattr(args, "shared_esm_max_batch_sequences", 64),
-            max_wait_ms=getattr(args, "shared_esm_max_wait_ms", 4.0),
-        )
-        print(
-            f"[shared-evo] loaded sdk_model={sequence_backend.sdk_name} "
-            f"hidden_size={sequence_backend.hidden_size} on {device}",
-            flush=True,
-        )
-    else:
-        print(f"[shared-hf] loading model={args.esm_model_name}", flush=True)
-        components = load_universal_hf_components(
+    except Exception:
+        print("[shared-esm] local tokenizer cache miss, falling back to hub", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.esm_model_name)
+
+    print("[shared-esm] loading model from local cache", flush=True)
+    try:
+        esm = AutoModel.from_pretrained(
             args.esm_model_name,
-            device=device,
-            trust_remote_code=getattr(args, "hf_trust_remote_code", True),
-        )
-        tokenizer = components.tokenizer
-        esm = components.model
-        print(
-            f"[shared-hf] loaded model_type={components.model_type} "
-            f"hidden_size={components.hidden_size} loader={components.model_loader_class} on {device} "
-            f"(local_cache={components.local_files_only_used})",
-            flush=True,
-        )
-        esm_forward_lock = threading.Lock()
-        esm_batch_worker = SharedESMBatchWorker(
-            tokenizer=tokenizer,
-            esm=esm,
-            device=device,
-            sequence_backend=None,
-            max_batch_sequences=getattr(args, "shared_esm_max_batch_sequences", 64),
-            max_wait_ms=getattr(args, "shared_esm_max_wait_ms", 4.0),
-        )
+            local_files_only=True,
+        ).to(device)
+    except Exception:
+        print("[shared-esm] local model cache miss, falling back to hub", flush=True)
+        esm = AutoModel.from_pretrained(args.esm_model_name).to(device)
+
+    print(f"[shared-esm] shared ESM model loaded on {device}", flush=True)
+    esm.eval()
+    for param in esm.parameters():
+        param.requires_grad = False
+    esm_forward_lock = threading.Lock()
+    esm_batch_worker = SharedESMBatchWorker(
+        tokenizer=tokenizer,
+        esm=esm,
+        device=device,
+        max_batch_sequences=getattr(args, "shared_esm_max_batch_sequences", 512),
+        max_wait_ms=getattr(args, "shared_esm_max_wait_ms", 4.0),
+    )
     esm_in_memory_cache_pool = SharedInMemoryESMCachePool(storage_dtype=torch.float16)
     interplm_sae_pool = SharedInterPLMSAEPool()
     return SharedESMComponents(
         tokenizer=tokenizer,
         esm=esm,
-        sequence_backend=sequence_backend,
         esm_forward_lock=esm_forward_lock,
         esm_batch_worker=esm_batch_worker,
         esm_in_memory_cache_pool=esm_in_memory_cache_pool,

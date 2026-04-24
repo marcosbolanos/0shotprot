@@ -283,19 +283,6 @@ def get_parser():
         type=str,
         default="facebook/esm2_t6_8M_UR50D",
     )
-    parser.add_argument(
-        "--hf_trust_remote_code",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Allow loading Hugging Face models/tokenizers with remote custom code.",
-    )
-    parser.add_argument(
-        "--hf_tokenization_mode",
-        type=str,
-        choices=["auto", "raw", "spaced", "split"],
-        default="auto",
-        help="Protein tokenization strategy for universal HF models.",
-    )
     parser.add_argument("--esm_mlp_hidden_dim", type=int, default=256)
     parser.add_argument("--esm_mlp_dropout", type=float, default=0.25)
     parser.add_argument("--esm_cnn_projection_dim", type=int, default=None)
@@ -348,29 +335,32 @@ def get_parser():
         "--low_rank_positional_rank",
         type=int,
         default=16,
-        help="Rank r for interplm_low_rank_positional surrogate.",
+        help="Rank for low-rank positional surrogate.",
     )
     parser.add_argument(
         "--low_rank_positional_l2",
         type=float,
         default=1e-4,
-        help="L2 regularization strength on A and B factors.",
+        help="L2 coefficient for low-rank positional factors/projection.",
     )
     parser.add_argument(
         "--low_rank_positional_lr",
         type=float,
-        default=1e-3,
-        help="Learning rate for interplm_low_rank_positional.",
+        default=None,
+        help="Optional optimizer LR override for low-rank positional surrogate.",
+    )
+    parser.add_argument(
+        "--low_rank_positional_repr_batch_size",
+        type=int,
+        default=None,
+        help="Representation extraction micro-batch for low-rank positional surrogate.",
     )
     parser.add_argument(
         "--low_rank_positional_input",
         type=str,
         choices=["esm", "sae", "esm_sae_concat"],
-        default="esm",
-        help=(
-            "Input representation for interplm_low_rank_positional "
-            "(esm, sae, or esm_sae_concat)."
-        ),
+        default="sae",
+        help="Input representation used by low-rank positional surrogate.",
     )
     parser.add_argument("--debug-events", action="store_true", default=False)
     parser.add_argument("--debug-heartbeat-seconds", type=float, default=15.0)
@@ -378,7 +368,7 @@ def get_parser():
     return parser
 
 
-def run_iter(args, logger, shared_esm_components=None):
+def run_iter(args, logger, shared_esm_components=None, shared_oracle=None):
     seed = args.seed
     set_seed(seed, args.full_deterministic)
     logger.info(f"Starting seed {seed}")
@@ -407,10 +397,10 @@ def run_iter(args, logger, shared_esm_components=None):
         debug_logger.start_heartbeat()
 
     wt_sequence = WT_SEQUENCES[args.task]
-    if debug_logger is not None:
+    if shared_oracle is None and debug_logger is not None:
         debug_logger.set_phase("oracle_load_start")
-    oracle = get_landscape(args.task)
-    if debug_logger is not None:
+    oracle = shared_oracle if shared_oracle is not None else get_landscape(args.task)
+    if shared_oracle is None and debug_logger is not None:
         debug_logger.set_phase("oracle_load_complete")
     dataset = RegressionDataset(args.task)
     if debug_logger is not None:

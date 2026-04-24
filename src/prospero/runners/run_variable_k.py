@@ -167,6 +167,18 @@ def _existing_valid_seed_ids(
     ]
 
 
+class ThreadSafeOracle:
+    """Serialize oracle calls so one shared oracle can serve multiple seeds safely."""
+
+    def __init__(self, oracle: object) -> None:
+        self._oracle = oracle
+        self._lock = threading.Lock()
+
+    def get_fitness(self, sequences):
+        with self._lock:
+            return self._oracle.get_fitness(sequences)
+
+
 def parse_int_list(value: str) -> list[int]:
     try:
         return [int(item) for item in value.split(",") if item]
@@ -310,6 +322,31 @@ def _build_protein_args(
     protein_args.interplm_repo_id = runner_args.interplm_repo_id
     protein_args.interplm_normalized = runner_args.interplm_normalized
     protein_args.sae_token_chunk_size = runner_args.sae_token_chunk_size
+    protein_args.low_rank_positional_rank = getattr(
+        runner_args,
+        "low_rank_positional_rank",
+        16,
+    )
+    protein_args.low_rank_positional_l2 = getattr(
+        runner_args,
+        "low_rank_positional_l2",
+        1e-4,
+    )
+    protein_args.low_rank_positional_lr = getattr(
+        runner_args,
+        "low_rank_positional_lr",
+        None,
+    )
+    protein_args.low_rank_positional_repr_batch_size = getattr(
+        runner_args,
+        "low_rank_positional_repr_batch_size",
+        None,
+    )
+    protein_args.low_rank_positional_input = getattr(
+        runner_args,
+        "low_rank_positional_input",
+        "sae",
+    )
     protein_args.disable_esm_cache = runner_args.disable_esm_cache
     protein_args.debug_events = runner_args.debug_events
     protein_args.debug_heartbeat_seconds = runner_args.debug_heartbeat_seconds
@@ -319,7 +356,10 @@ def _build_protein_args(
         protein_args.ensemble_size = ensemble_size
     if proxy_batch_size is not None:
         protein_args.proxy_batch_size = proxy_batch_size
-    if runner_args.surrogate_arch == "interplm_mean_pool_ridge":
+    if runner_args.surrogate_arch in {
+        "interplm_mean_pool_ridge",
+        "interplm_low_rank_positional",
+    }:
         if ensemble_size is None:
             protein_args.ensemble_size = 1
     return protein_args
@@ -328,29 +368,36 @@ def _build_protein_args(
 def _run_seed_in_process(
     protein_args: argparse.Namespace,
     shared_esm_components,
+    shared_oracle,
 ) -> None:
     from prospero.runners.run_protein import (
         logger as protein_logger,
         run_iter as run_protein_iter,
     )
 
-    print(f"[shared-esm] starting seed {protein_args.seed}", flush=True)
+    print(f"[in-process] starting seed {protein_args.seed}", flush=True)
     try:
-        run_protein_iter(protein_args, protein_logger, shared_esm_components)
+        run_protein_iter(
+            protein_args,
+            protein_logger,
+            shared_esm_components,
+            shared_oracle=shared_oracle,
+        )
     except Exception:
         print(
-            f"[shared-esm] seed {protein_args.seed} raised an exception",
+            f"[in-process] seed {protein_args.seed} raised an exception",
             file=sys.stderr,
             flush=True,
         )
         traceback.print_exc()
         raise
-    print(f"[shared-esm] finished seed {protein_args.seed}", flush=True)
+    print(f"[in-process] finished seed {protein_args.seed}", flush=True)
 
 
 def _run_seed_in_process_with_retries(
     protein_args: argparse.Namespace,
     shared_esm_components,
+    shared_oracle,
     *,
     safe: bool,
     max_seed_retries: int,
@@ -359,7 +406,7 @@ def _run_seed_in_process_with_retries(
     total_attempts = 1 + (max_seed_retries if safe else 0)
     for attempt in range(1, total_attempts + 1):
         try:
-            _run_seed_in_process(protein_args, shared_esm_components)
+            _run_seed_in_process(protein_args, shared_esm_components, shared_oracle)
             return
         except Exception:
             if attempt >= total_attempts:
@@ -386,6 +433,7 @@ def _run_seed_in_process_with_retries(
 def main() -> None:
     frozen_esm_surrogate_archs = {
         "interplm_mean_pool_ridge",
+        "interplm_low_rank_positional",
         "frozen_esm_mlp",
         "frozen_esm_cnn",
         "frozen_esm_flat_linear",
@@ -405,6 +453,7 @@ def main() -> None:
             "cnn",
             "one_hot_ridge",
             "interplm_mean_pool_ridge",
+            "interplm_low_rank_positional",
             "frozen_esm_mlp",
             "frozen_esm_cnn",
             "frozen_esm_flat_linear",
@@ -437,11 +486,20 @@ def main() -> None:
         default=True,
     )
     parser.add_argument("--sae-token-chunk-size", type=int, default=1024)
+    parser.add_argument("--low-rank-positional-rank", type=int, default=16)
+    parser.add_argument("--low-rank-positional-l2", type=float, default=1e-4)
+    parser.add_argument("--low-rank-positional-lr", type=float, default=None)
+    parser.add_argument("--low-rank-positional-repr-batch-size", type=int, default=None)
+    parser.add_argument(
+        "--low-rank-positional-input",
+        choices=("esm", "sae", "esm_sae_concat"),
+        default="sae",
+    )
     parser.add_argument(
         "--ensemble-size",
         type=int,
         default=None,
-        help="Override surrogate ensemble size. Defaults to 1 for interplm_mean_pool_ridge.",
+        help="Override surrogate ensemble size. Defaults to 1 for InterPLM ridge/low-rank surrogate arches.",
     )
     parser.add_argument(
         "--proxy-batch-size",
@@ -464,6 +522,15 @@ def main() -> None:
     parser.add_argument("--debug-heartbeat-seconds", type=float, default=15.0)
     parser.add_argument("--n-queries-base", type=int, default=None)
     parser.add_argument("--uv-cache-dir", default=os.environ.get("UV_CACHE_DIR"))
+    parser.add_argument(
+        "--share-oracle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Share a single oracle instance across in-process seed workers. "
+            "Defaults to enabled for D_SHIFT* tasks."
+        ),
+    )
     args = parser.parse_args()
 
     results_dir = args.results_dir
@@ -535,28 +602,47 @@ def main() -> None:
                 else:
                     scheduled_seeds_by_n_samples[n_samples] = list(seeds)
             share_frozen_esm = args.surrogate_arch in frozen_esm_surrogate_archs
+            share_oracle = (
+                args.task.startswith("D_SHIFT")
+                if args.share_oracle is None
+                else args.share_oracle
+            )
             if share_frozen_esm:
                 print(
                     f"[shared-esm] enabled by default for {args.surrogate_arch}",
                     flush=True,
                 )
-                if driver_debug_logger is not None:
-                    driver_debug_logger.event(
-                        "shared_esm_enabled",
-                        surrogate_arch=args.surrogate_arch,
-                    )
+            if share_oracle:
+                print(
+                    f"[shared-oracle] enabled for task {args.task}",
+                    flush=True,
+                )
+            if driver_debug_logger is not None and share_frozen_esm:
+                driver_debug_logger.event(
+                    "shared_esm_enabled",
+                    surrogate_arch=args.surrogate_arch,
+                )
+            if driver_debug_logger is not None and share_oracle:
+                driver_debug_logger.event(
+                    "shared_oracle_enabled",
+                    task=args.task,
+                )
             if args.safe:
                 print(
                     "[safe] enabled: failed seeds will be retried "
                     f"up to {args.max_seed_retries} times",
                     flush=True,
                 )
-                if driver_debug_logger is not None:
-                    driver_debug_logger.event(
-                        "safe_enabled",
-                        max_seed_retries=args.max_seed_retries,
-                        retry_backoff_seconds=args.retry_backoff_seconds,
-                    )
+            shared_oracle = None
+            if share_oracle:
+                from prospero.landscapes import get_landscape
+
+                print(
+                    f"[shared-oracle] loading oracle once for task {args.task}",
+                    flush=True,
+                )
+                shared_oracle = ThreadSafeOracle(get_landscape(args.task))
+                print("[shared-oracle] ready", flush=True)
             if args.resume_missing_seeds:
                 print(
                     "[resume] enabled: valid existing seed checkpoints will be skipped",
@@ -567,6 +653,17 @@ def main() -> None:
                         "resume_missing_seeds_enabled",
                         completed_seeds_by_n_samples=completed_seeds_by_n_samples,
                     )
+            if driver_debug_logger is not None and args.safe:
+                driver_debug_logger.event(
+                    "safe_enabled",
+                    max_seed_retries=args.max_seed_retries,
+                    retry_backoff_seconds=args.retry_backoff_seconds,
+                )
+            if share_oracle and driver_debug_logger is not None:
+                driver_debug_logger.event(
+                    "shared_oracle_ready",
+                    task=args.task,
+                )
 
             total_runs = sum(
                 len(scheduled_seeds_by_n_samples[n_samples])
@@ -645,6 +742,38 @@ def main() -> None:
                     cmd_template.extend(
                         ["--sae_token_chunk_size", str(args.sae_token_chunk_size)]
                     )
+                    cmd_template.extend(
+                        [
+                            "--low_rank_positional_rank",
+                            str(args.low_rank_positional_rank),
+                        ]
+                    )
+                    cmd_template.extend(
+                        [
+                            "--low_rank_positional_l2",
+                            str(args.low_rank_positional_l2),
+                        ]
+                    )
+                    if args.low_rank_positional_lr is not None:
+                        cmd_template.extend(
+                            [
+                                "--low_rank_positional_lr",
+                                str(args.low_rank_positional_lr),
+                            ]
+                        )
+                    if args.low_rank_positional_repr_batch_size is not None:
+                        cmd_template.extend(
+                            [
+                                "--low_rank_positional_repr_batch_size",
+                                str(args.low_rank_positional_repr_batch_size),
+                            ]
+                        )
+                    cmd_template.extend(
+                        [
+                            "--low_rank_positional_input",
+                            str(args.low_rank_positional_input),
+                        ]
+                    )
                     if not args.ridge_fit_intercept:
                         cmd_template.append("--no-ridge_fit_intercept")
                     if args.disable_esm_cache:
@@ -666,6 +795,7 @@ def main() -> None:
                     seed_cmds = [
                         cmd_template + ["--seed", str(seed)] for seed in seeds_to_run
                     ]
+                    use_in_process_runner = share_frozen_esm or share_oracle
                     if not seeds_to_run:
                         print(
                             f"[resume] no pending seeds for n_samples={n_samples}",
@@ -677,7 +807,7 @@ def main() -> None:
                                 n_samples=n_samples,
                                 completed_seeds=completed_seeds,
                             )
-                    elif share_frozen_esm:
+                    elif use_in_process_runner:
                         executor_workers = max_workers
                         with concurrent.futures.ThreadPoolExecutor(
                             max_workers=executor_workers
@@ -686,19 +816,18 @@ def main() -> None:
                             shared_esm_components = None
                             if args.uv_cache_dir:
                                 os.environ["UV_CACHE_DIR"] = args.uv_cache_dir
-                            print(
-                                f"[shared-esm] preparing shared ESM for {args.surrogate_arch}",
-                                flush=True,
-                            )
-                            if driver_debug_logger is not None:
-                                driver_debug_logger.event(
-                                    "shared_esm_prepare_start",
-                                    surrogate_arch=args.surrogate_arch,
+                            if share_frozen_esm:
+                                print(
+                                    f"[shared-esm] preparing shared ESM for {args.surrogate_arch}",
+                                    flush=True,
                                 )
-                            shared_esm_components = prepare_shared_esm_components(args)
-                            print("[shared-esm] shared ESM ready", flush=True)
-                            if driver_debug_logger is not None:
-                                driver_debug_logger.event("shared_esm_prepare_complete")
+                                shared_esm_components = prepare_shared_esm_components(args)
+                                print("[shared-esm] shared ESM ready", flush=True)
+                                if driver_debug_logger is not None:
+                                    driver_debug_logger.event(
+                                        "shared_esm_prepare_complete",
+                                        surrogate_arch=args.surrogate_arch,
+                                    )
                             for seed in seeds_to_run:
                                 protein_args = _build_protein_args(
                                     runner_args=args,
@@ -722,6 +851,7 @@ def main() -> None:
                                     _run_seed_in_process_with_retries,
                                     deepcopy(protein_args),
                                     shared_esm_components,
+                                    shared_oracle,
                                     safe=args.safe,
                                     max_seed_retries=args.max_seed_retries,
                                     retry_backoff_seconds=args.retry_backoff_seconds,
