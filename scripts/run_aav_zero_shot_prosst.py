@@ -23,10 +23,10 @@ from prospero.utils import get_new_starting_seq, set_seed
 
 
 AA20 = list("ACDEFGHIKLMNPQRSTVWY")
-PROTEINGYM_DIR = Path("outputs/prosst_zero_shot_alignment_20260603/proteingym_benchmark")
+STRUCTURE_TOKENS_DIR = Path("outputs/prosst_structure_tokens")
 class StructureMapping:
-    def __init__(self, protein_gym_name, offset, covered_length, identity, note=""):
-        self.protein_gym_name = protein_gym_name
+    def __init__(self, structure_token_name, offset, covered_length, identity, note=""):
+        self.structure_token_name = structure_token_name
         self.offset = offset
         self.covered_length = covered_length
         self.identity = identity
@@ -46,7 +46,7 @@ TASK_MAPPINGS = {
         0,
         439,
         0.9732,
-        "ProSpero LGK has 8 C-terminal residues without ProteinGym structure tokens; those positions are fixed.",
+        "ProSpero LGK has 8 C-terminal residues without precomputed structure tokens; those positions are fixed.",
     ),
 }
 SUPPORTED_TASKS = sorted(TASK_MAPPINGS)
@@ -80,7 +80,7 @@ def get_parser():
         ),
     )
     p.add_argument("--model_path", default="AI4Protein/ProSST-2048")
-    p.add_argument("--proteingym_dir", default=str(PROTEINGYM_DIR))
+    p.add_argument("--structure_tokens_dir", default=str(STRUCTURE_TOKENS_DIR))
     p.add_argument("--structure_vocab_size", default="2048")
     p.add_argument("--device", default="cuda")
     p.add_argument("--debug_generation_trace", action=argparse.BooleanOptionalAction, default=True)
@@ -259,10 +259,10 @@ class ProSSTGenerator:
         self.full_wt_length = len(wt)
         self.covered_length = min(mapping.covered_length, len(wt))
         structure_path = (
-            Path(args.proteingym_dir)
+            Path(args.structure_tokens_dir)
             / "structure_sequence"
             / args.structure_vocab_size
-            / f"{mapping.protein_gym_name}.fasta"
+            / f"{mapping.structure_token_name}.fasta"
         )
         structure_tokens = read_structure_tokens(structure_path)
         self.structure_tokens = structure_tokens[mapping.offset : mapping.offset + self.covered_length]
@@ -754,8 +754,8 @@ def run_seed(args):
         "task": args.task,
         "model": args.model_path,
         "structure": {
-            "source": "ProSST precomputed ProteinGym structure tokens",
-            "protein_gym_name": generator.mapping.protein_gym_name,
+            "source": "ProSST precomputed structure tokens",
+            "structure_token_name": generator.mapping.structure_token_name,
             "offset": generator.mapping.offset,
             "covered_length": generator.covered_length,
             "identity": generator.mapping.identity,
