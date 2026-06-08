@@ -1,0 +1,8 @@
+[submodule "src/prospero"]
+	path = src/prospero
+	url = git@github.com:marcosbolanos/ProSpero.git
+	branch = src-package
+[submodule "src/prosst"]
+	path = src/prosst
+	url = git@github.com:marcosbolanos/ProSST.git
+	branch = src-package

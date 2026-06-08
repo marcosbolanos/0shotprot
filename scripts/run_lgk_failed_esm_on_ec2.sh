@@ -16,6 +16,7 @@ MONITOR_INTERVAL_SECONDS="${MONITOR_INTERVAL_SECONDS:-5}"
 WAIT_FOR_TERMINATION="${WAIT_FOR_TERMINATION:-0}"
 ORACLES_S3_PREFIX="${ORACLES_S3_PREFIX:-oracles}"
 HF_TOKEN="${HF_TOKEN:-}"
+ROOT_VOLUME_GB="${ROOT_VOLUME_GB:-300}"
 
 if [[ -z "${BUCKET:-}" ]]; then
   BUCKET="$(
@@ -146,11 +147,13 @@ cd repo
 
 echo "Syncing oracle assets from __ORACLES_S3_URI__ to ${WORKDIR}/repo/oracles"
 aws s3 sync "__ORACLES_S3_URI__/" "${WORKDIR}/repo/oracles/"
-if [[ ! -f "${WORKDIR}/repo/oracles/__TASK__/pytorch_model.bin" ]]; then
-  echo "Missing oracle checkpoint: ${WORKDIR}/repo/oracles/__TASK__/pytorch_model.bin"
-  echo "Available oracle files under ${WORKDIR}/repo/oracles:"
-  find "${WORKDIR}/repo/oracles" -maxdepth 3 -type f | sort | head -n 200
-  shutdown -h now
+if [[ "__TASK__" != D_SHIFT* ]]; then
+  if [[ ! -f "${WORKDIR}/repo/oracles/__TASK__/pytorch_model.bin" ]]; then
+    echo "Missing oracle checkpoint: ${WORKDIR}/repo/oracles/__TASK__/pytorch_model.bin"
+    echo "Available oracle files under ${WORKDIR}/repo/oracles:"
+    find "${WORKDIR}/repo/oracles" -maxdepth 3 -type f | sort | head -n 200
+    shutdown -h now
+  fi
 fi
 
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -368,24 +371,35 @@ run_model() {
   local slug="$2"
   local model_dir="${RUN_DIR}/${slug}"
   mkdir -p "${model_dir}"
+  : > "${model_dir}/run.log"
   local started
   started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   {
     echo "[preflight] python/uv/esm environment check"
     uv --version || true
-    uv sync --locked || true
-    uv run --locked python - <<'PY'
+    rm -rf .venv
+    uv sync --locked --reinstall-package esm --refresh-package esm
+    uv pip install --python .venv/bin/python --reinstall "esm==3.2.3"
+    MODEL_ID="${model_id}" uv run --locked python - <<'PY'
 import sys
+import os
 try:
     import esm
     import esm.pretrained as p
+    from prospero.plm.evolutionaryscale import EvolutionaryScaleBackend
     print("python", sys.version)
     print("esm_version", getattr(esm, "__version__", "unknown"))
     print("esm_file", getattr(esm, "__file__", "unknown"))
     print("pretrained_file", getattr(p, "__file__", "unknown"))
     print("has_load_local_model", hasattr(p, "load_local_model"))
+    if not hasattr(p, "load_local_model"):
+        raise SystemExit("esm.pretrained.load_local_model missing in runtime")
+    backend = EvolutionaryScaleBackend.load(os.environ["MODEL_ID"], device="cpu")
+    print("backend_smoke_test_model", backend.model_id)
+    print("backend_smoke_test_hidden_size", backend.hidden_size)
 except Exception as exc:
     print("esm_preflight_error", repr(exc))
+    raise
 PY
   } >> "${model_dir}/run.log" 2>&1
   set +e
@@ -400,7 +414,7 @@ PY
     --output-json-full "${model_dir}/single_mutant_energy_full.json" \
     --oracle-cache-json "outputs/0424_experiments/oracle_single_mutant_cache.json" \
     --results_dirpath "${model_dir}" \
-    > "${model_dir}/run.log" 2>&1
+    >> "${model_dir}/run.log" 2>&1
   local rc=$?
   set -e
   local ended
@@ -440,8 +454,8 @@ import pathlib
 import sys
 path = pathlib.Path(sys.argv[1])
 text = path.read_text(encoding="utf-8")
-text = text.replace("S3_URI_PLACEHOLDER", ${S3_URI@Q})
 text = text.replace("ORACLES_S3_URI_PLACEHOLDER", ${ORACLES_S3_URI@Q})
+text = text.replace("S3_URI_PLACEHOLDER", ${S3_URI@Q})
 text = text.replace("HF_TOKEN_PLACEHOLDER", ${HF_TOKEN@Q})
 text = text.replace("TASK_PLACEHOLDER", ${TASK@Q})
 text = text.replace("PROXY_BATCH_SIZE_PLACEHOLDER", ${PROXY_BATCH_SIZE@Q})
@@ -454,6 +468,7 @@ chmod +x "${USER_DATA_FILE}"
 echo "Launching ${INSTANCE_TYPE} in ${REGION}..."
 INSTANCE_ID=""
 SUBNET_ID_SELECTED=""
+INSTANCE_NAME_TAG="prospero-${TASK,,}-failed-esm-retry"
 for subnet in "${CANDIDATE_SUBNETS[@]}"; do
   echo "Trying subnet ${subnet}..."
   set +e
@@ -463,10 +478,11 @@ for subnet in "${CANDIDATE_SUBNETS[@]}"; do
       --image-id "${AMI_ID}" \
       --instance-type "${INSTANCE_TYPE}" \
       --iam-instance-profile "Name=${INSTANCE_PROFILE_NAME}" \
+      --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${ROOT_VOLUME_GB},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
       --subnet-id "${subnet}" \
       --associate-public-ip-address \
       --instance-initiated-shutdown-behavior terminate \
-      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=prospero-lgk-failed-esm-retry}]" \
+      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME_TAG}}]" \
       --user-data "file://${USER_DATA_FILE}" \
       --query 'Instances[0].InstanceId' \
       --output text 2>&1
@@ -501,6 +517,7 @@ cat > "${MANIFEST_FILE}" <<EOF
   "oracles_s3_prefix": "${ORACLES_S3_PREFIX}",
   "oracles_s3_uri": "${ORACLES_S3_URI}",
   "task": "${TASK}",
+  "root_volume_gb": ${ROOT_VOLUME_GB},
   "proxy_batch_size": ${PROXY_BATCH_SIZE},
   "hf_token_provided": $([[ -n "${HF_TOKEN}" ]] && echo "true" || echo "false"),
   "models": [

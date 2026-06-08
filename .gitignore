@@ -1,6 +1,17 @@
 # outputs folder
 outputs/
 
+# Local experiment data and tool state
+external/
+oracles/
+.codex
+.codex/
+.mplconfig/
+.uv_cache/
+
+# local files
+local/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
