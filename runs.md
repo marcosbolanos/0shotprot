@@ -1799,3 +1799,28 @@ Outputs:
 - `outputs/rl_vs_og/zero_shotprot_combined_budgets_grpo/zero_shotprot_grpo_combined_k8_k128_mean_max.pdf`
 - `outputs/rl_vs_og/zero_shotprot_combined_budgets_grpo/zero_shotprot_grpo_combined_k8_k128_mean_max.svg`
 - Summary: `outputs/rl_vs_og/zero_shotprot_combined_budgets_grpo/plot_summary.txt`
+
+## 2026-06-09 - launched GRPO reproduction run
+
+Launched full GRPO-focused reproduction run after committing cleanup and determinism changes.
+
+Commits:
+- Parent repo: `9bc0464 Lock reproduction to GRPO workflow`
+- ProSpero submodule: `1f84c0c Make ProSST reproduction GRPO-only`
+
+Run:
+- tmux session: `grpo_reproduction_20260609`
+- Command: `uv run python scripts/reproduce.py --timestamp grpo_reproduction_20260609 --gpu GPU-025e10e6-263f-d814-6dd5-added86fc8af`
+- Output root: `outputs/reproduction/grpo_reproduction_20260609/`
+- Launch log: `outputs/grpo_reproduction_20260609.launch.log`
+- GPU: A6000 UUID `GPU-025e10e6-263f-d814-6dd5-added86fc8af`
+
+Stages in recipe:
+- ProSpero CNN variable-K sanity check.
+- 0shotProt ProSST GRPO restricted/cluster vocabulary.
+- 0shotProt ProSST GRPO unrestricted/full vocabulary ablation.
+- Epistasis additivity tests.
+
+Initial status:
+- Started stage `prospero_AAV`.
+- Created `outputs/reproduction/grpo_reproduction_20260609/config.json` and `logs/0000_prospero_AAV.log`.
