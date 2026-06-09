@@ -1687,3 +1687,115 @@ Existing completed unrestricted K=128 runs retained for comparison:
 - GRPO-cluster ProSST K=128 completed 5/5 seeds for AAV, AMIE, E4B, GFP, LGK, Pab1, TEM, UBE2I. Final mean max: AAV 0.6441, AMIE 0.2618, E4B 8.1430, GFP 3.6175, LGK 0.04258, Pab1 1.9490, TEM 1.2304, UBE2I 2.9995.
 - TEM ProSST no-finetune K=128 trace ablation completed 5/5 seeds with traces. Final mean max 1.23083.
 - No-surrogate scope note: old ProSpero/EvoDiff no-surrogate runs exist for AAV and LGK (`outputs/aav_zero_shot_prospero_20260528`, `outputs/lgk_zero_shot_prospero_20260528`) and AAV fixed-mask route sweeps (`outputs/aav_zero_shot_fixed_mask_k4_20260529`). I do not see an equivalent old no-finetune ProSpero/EvoDiff no-surrogate sweep across all 8 landscapes. The all-landscape zero-shot work later was online EvoDiff/ProSST fine-tuning or ProSST rank-cluster style, not the same original removed-surrogate ProSpero ablation.
+
+## 2026-06-08 - ProSST PUCT/MCTS decoder smoke and AAV test
+
+Implemented a modular PUCT/MCTS decoder for ProSST zero-shot generation.
+
+Code changes:
+- Added generic PUCT search core under `src/prospero/search/puct.py`.
+- Added ProSST-specific PUCT evaluator under `src/prospero/search/prosst_puct.py`.
+- Added `--decode_strategy {sample,mcts}`, `--mcts_simulations`, and `--mcts_c_puct` to the ProSST zero-shot runner. Default remains `sample`, so existing configs are unchanged unless MCTS is requested.
+- Added unit tests for generic PUCT behavior and the ProSST adapter with fake logits.
+
+Validation:
+- `uv run python -m pytest tests/test_puct_search.py tests/test_prosst_puct.py -q`: passed, 5 tests.
+- `uv run python -m compileall -q src/prospero/search src/prospero/runners/run_zero_shot_prosst.py`: passed.
+- Runner help confirms MCTS flags are exposed.
+
+Smoke run:
+- Command used A6000 pinned by UUID `GPU-025e10e6-263f-d814-6dd5-added86fc8af`.
+- Output: `outputs/mcts_smoke_20260608/`.
+- Config: AAV, seed 1, one round, 2 queries, batch size 4, mask budget 4, mixed masking, restricted/cluster vocabulary, MCTS decode, 8 simulations.
+- Completed cleanly. Best oracle fitness: 0.3782479603.
+
+AAV test run:
+- tmux session: `mcts_aav_test_20260608` (completed and exited).
+- Output: `outputs/mcts_aav_test_20260608/`.
+- Log: `outputs/mcts_aav_test_20260608.log`.
+- Config: AAV, seed 1, one round, 16 queries, batch size 32, mask budget 4, mixed masking, restricted/cluster vocabulary, MCTS decode, 32 simulations, `c_puct=1.5`.
+- Completed cleanly on A6000 pinned by UUID `GPU-025e10e6-263f-d814-6dd5-added86fc8af`.
+- Trace counts: 32 `mask_selected`, 32 `mcts_summary`, 32 `candidate`, 128 `smc_step`, 16 `candidate_selected_for_query`, 16 `oracle_query`.
+- Selected zero-shot score range: min 3.697951, median 6.955224, max 11.211452.
+- Oracle fitness over selected candidates: min 0.0, median 0.0985704, max 0.3782479603.
+
+Engineering note:
+- This first MCTS implementation is intentionally auditable and node-cached, but not batched across particles/tree nodes yet. It is appropriate for small tests and debugging; full 128-query, 10-round campaigns will need batching or lower simulation counts before being compute-efficient.
+
+## 2026-06-09 - fair AAV ProSST MCTS n=128 comparison
+
+Launched and completed a fair one-round AAV comparison for the ProSST PUCT/MCTS decoder using the same query budget as the old stochastic unmasking comparison.
+
+Run:
+- tmux session: `mcts_aav_n128_20260609` (completed and exited).
+- GPU: A6000 pinned by UUID `GPU-025e10e6-263f-d814-6dd5-added86fc8af`.
+- Output: `outputs/mcts_aav_n128_20260609/`.
+- Log: `outputs/mcts_aav_n128_20260609.log`.
+- Config: AAV, seed 1, one round, `n_queries=128`, `batch_size=256`, `mask_budget=4`, `mixed_explore_exploit` masking, restricted/cluster vocabulary, `decode_strategy=mcts`, `mcts_simulations=32`, `mcts_c_puct=1.5`, traces enabled.
+
+Trace counts:
+- 256 `mask_selected`, 256 `mcts_summary`, 256 `candidate`, 1024 `smc_step`, 128 `candidate_selected_for_query`, 128 `oracle_query`.
+
+Round-1 comparison against old ProSST stochastic unmasking (`outputs/aav_zero_shot_prosst_mixed_k4_n128_20260603`, seed 1, round 1):
+- MCTS all generated candidates: n=256, zero-shot score median 2.9087, mean 3.4689, max 12.3289, positive fraction 99.6%.
+- Stochastic all generated candidates: n=256, zero-shot score median 0.6926, mean 0.9388, max 12.3289, positive fraction 62.5%.
+- MCTS selected candidates: n=128, zero-shot score median 4.6099, mean 5.1719, max 12.3289, positive fraction 100%.
+- Stochastic selected candidates: n=128, zero-shot score median 2.1103, mean 2.7978, max 12.3289, positive fraction 100%.
+- MCTS oracle fitness: median 0.2090, mean 0.1925, max 0.4690, positive fraction 84.4%.
+- Stochastic oracle fitness: median 0.1852, mean 0.1844, max 0.5272, positive fraction 79.7%.
+
+Interpretation:
+- MCTS materially improves the generated and selected zero-shot score distribution under the delta-PLL objective.
+- MCTS modestly improves median/mean oracle fitness and positive-fitness fraction at the same query budget.
+- MCTS does not improve the best oracle candidate in this one-round seed-1 comparison; old stochastic unmasking still had the higher max oracle fitness.
+
+## 2026-06-09 - PLM full PLL alignment rerun
+
+Question: previous Spearman alignment tables used fast mutated-position PLM estimates, not proper whole-sequence PLL. Added and ran a full-PLL alignment benchmark.
+
+Code:
+- Added `src/prospero/runners/run_plm_full_pll_alignment.py`.
+- Computes old estimate Spearman from existing alignment CSVs and recomputes proper whole-sequence PLL by masking every residue position.
+- PLMs: EvoDiff OA_DM_38M, ESM2 650M (`facebook/esm2_t33_650M_UR50D`), ProSST 2048 (`AI4Protein/ProSST-2048`).
+- ProSST uses whole covered-region PLL; for LGK the unstructured C-terminal tail without structure tokens is excluded.
+
+Runs:
+- Smoke: `outputs/plm_full_pll_alignment_smoke_20260609/`, AAV n=4, completed.
+- Attempted all-landscape n=64: `outputs/plm_full_pll_alignment_n64_20260609/`, stopped because ESM full PLL was too slow interactively. Partial results through AMIE EvoDiff retained.
+- Completed all-landscape n=16: `outputs/plm_full_pll_alignment_n16_20260609/`, A6000 pinned by UUID `GPU-025e10e6-263f-d814-6dd5-added86fc8af`.
+
+Key result:
+- Previous alignment score was not proper full PLL.
+- Proper full PLL is not consistently better. It helps in some cases but hurts in others, especially where mutated-position log-odds is more directly tied to variant effects.
+- Full ESM PLL is the runtime bottleneck: examples from n=16 are AMIE 192s, LGK 341s, TEM 135s.
+
+## 2026-06-09 - GRPO main optimization-loop plots
+
+Generated simplified main mean-max optimization-loop plots using ProSST GRPO-cluster runs instead of rank-cluster runs.
+
+Command:
+- `uv run python -m prospero.runners.plot_simplified_zero_shotprot_mean_max --output-dir outputs/rl_vs_og/zero_shotprot_simplified_grpo --prosst-k8-root outputs/prosst_ft_all_landscapes_n8_grpo_cluster_20260604 --prosst-k128-root outputs/prosst_ft_all_landscapes_n128_grpo_cluster_20260604 --prosst-label '0shotProt GRPO (w/ ProSST)'`
+
+Outputs:
+- `outputs/rl_vs_og/zero_shotprot_simplified_grpo/zero_shotprot_vs_prospero_k8_mean_max.png`
+- `outputs/rl_vs_og/zero_shotprot_simplified_grpo/zero_shotprot_vs_prospero_k8_mean_max.pdf`
+- `outputs/rl_vs_og/zero_shotprot_simplified_grpo/zero_shotprot_vs_prospero_k8_mean_max.svg`
+- `outputs/rl_vs_og/zero_shotprot_simplified_grpo/zero_shotprot_vs_prospero_k128_mean_max.png`
+- `outputs/rl_vs_og/zero_shotprot_simplified_grpo/zero_shotprot_vs_prospero_k128_mean_max.pdf`
+- `outputs/rl_vs_og/zero_shotprot_simplified_grpo/zero_shotprot_vs_prospero_k128_mean_max.svg`
+
+Summary file:
+- `outputs/rl_vs_og/zero_shotprot_simplified_grpo/plot_summary.txt`
+
+## 2026-06-09 - combined K=8/K=128 optimization-loop visualization
+
+Generated a new simplified combined-budget main optimization-loop visualization for GRPO. K=128 uses saturated method colors; K=8 uses pastel versions of the same colors on the same axes.
+
+Code:
+- Added `src/prospero/runners/plot_combined_budget_mean_max.py`.
+
+Outputs:
+- `outputs/rl_vs_og/zero_shotprot_combined_budgets_grpo/zero_shotprot_grpo_combined_k8_k128_mean_max.png`
+- `outputs/rl_vs_og/zero_shotprot_combined_budgets_grpo/zero_shotprot_grpo_combined_k8_k128_mean_max.pdf`
+- `outputs/rl_vs_og/zero_shotprot_combined_budgets_grpo/zero_shotprot_grpo_combined_k8_k128_mean_max.svg`
+- Summary: `outputs/rl_vs_og/zero_shotprot_combined_budgets_grpo/plot_summary.txt`
