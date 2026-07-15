@@ -1824,3 +1824,178 @@ Stages in recipe:
 Initial status:
 - Started stage `prospero_AAV`.
 - Created `outputs/reproduction/grpo_reproduction_20260609/config.json` and `logs/0000_prospero_AAV.log`.
+
+## 2026-07-08 - launched ProSST no-finetune reproduction ablation
+
+Added a no-finetune ablation stage to `scripts/reproduce.py`:
+- Stage: `grpo_noft_cluster`
+- Model: ProSST 2048
+- Fine-tuning: disabled
+- Vocabulary: restricted/charge cluster
+- Masking: `mixed_explore_exploit`, mask budget 4
+- Budgets: K=8 and K=128
+- Seeds: 1-5
+- Tasks: AAV, LGK, GFP, Pab1, AMIE, E4B, TEM, UBE2I
+- Traces: enabled via `--debug_generation_trace`
+
+Output root:
+- `outputs/reproduction/grpo_noft_ablation_20260708/`
+
+Execution strategy:
+- Dynamic shared queue to handle variable task runtimes and GPU capacity.
+- 6 tmux workers launched:
+  - A6000 UUID `GPU-025e10e6-263f-d814-6dd5-added86fc8af`: 3 workers
+  - RTX 2080 Ti UUID `GPU-fcb13561-e5da-20e1-2ff7-a9bdbfa68c26`: 1 worker
+  - RTX 2080 Ti UUID `GPU-a3d54441-08da-ed66-fa0f-6aaaaf97baea`: 1 worker
+  - RTX 2080 Ti UUID `GPU-6faf056b-00ab-15fd-e25c-a149c7dcf3d7`: 1 worker
+
+Tracking files:
+- Queue state: `outputs/reproduction/grpo_noft_ablation_20260708/queue/state.json`
+- Worker logs: `outputs/reproduction/grpo_noft_ablation_20260708/worker_logs/`
+- Commands: `outputs/reproduction/grpo_noft_ablation_20260708/queue/commands.json`
+
+Initial status:
+- 80 total seed jobs queued.
+- First jobs started successfully across all GPUs.
+- Early progress showed completed AAV K=8 seeds and no recorded failures.
+
+Completion update:
+- `grpo_noft_cluster` no-finetune ablation completed successfully.
+- Queue status: 80/80 jobs done, 0 failed.
+- Result files: 80 seed pickles present.
+- GPUs returned to idle after completion.
+
+## 2026-07-09 - launched focused GRPO fine-tuning policy sweep
+
+Purpose:
+- Test whether a closer-to-GRPO masked-PLM objective improves over the current weighted-NLL fine-tuning policy.
+- This is not part of the locked reproduction recipe yet; it is a policy-selection sweep before comparing the chosen FT policy against no-FT.
+
+Code changes under test:
+- Added `reward_mode=ppo_ratio` to ProSST fine-tuning.
+- PPO-ratio mode snapshots old target log-probs for randomly masked training positions before updates.
+- Loss uses clipped policy ratio with exact AA-vocabulary KL to frozen base ProSST.
+- Metadata now distinguishes PPO-ratio objective from weighted-NLL objective.
+
+Output root:
+- `outputs/grpo_ft_policy_sweep_20260709/`
+
+Sweep grid:
+- Tasks: AAV, Pab1
+- Budgets: K=8, K=128
+- Seeds: 1-5
+- Total jobs: 120
+- Shared settings: ProSST 2048, restricted/cluster vocabulary, `mixed_explore_exploit`, mask budget 4, lambda_KL=2, lr=3e-5, finetune batch size 1, traces enabled.
+
+Variants:
+- `local_nll_neg025_e5`: current weighted-NLL objective, latest-round only, negative_weight=0.25, epochs=5.
+- `local_nll_neg1_e5`: weighted-NLL objective, latest-round only, negative_weight=1.0, epochs=5.
+- `ppo_latest_neg025_e1`: PPO-ratio objective, latest-round only, negative_weight=0.25, epochs=1.
+- `ppo_latest_neg1_e1`: PPO-ratio objective, latest-round only, negative_weight=1.0, epochs=1.
+- `ppo_latest_neg1_e2`: PPO-ratio objective, latest-round only, negative_weight=1.0, epochs=2.
+- `ppo_replay_all_neg1_e2`: PPO-ratio objective, replay-all, negative_weight=1.0, epochs=2.
+
+Execution strategy:
+- Dynamic shared queue with 6 tmux workers.
+- A6000 UUID `GPU-025e10e6-263f-d814-6dd5-added86fc8af`: 3 workers.
+- RTX 2080 Ti UUIDs `GPU-fcb13561-e5da-20e1-2ff7-a9bdbfa68c26`, `GPU-a3d54441-08da-ed66-fa0f-6aaaaf97baea`, `GPU-6faf056b-00ab-15fd-e25c-a149c7dcf3d7`: 1 worker each.
+
+Initial status:
+- Workers launched and visible in tmux.
+- All GPUs active.
+- Queue initially showed 6 claimed, 0 done, 0 failed.
+
+Completion update:
+- `outputs/grpo_ft_policy_sweep_20260709/` completed successfully.
+- Queue status: 120/120 jobs done, 0 failed.
+- Result files: 120 seed pickles present.
+- Summary CSV: `outputs/grpo_ft_policy_sweep_20260709/summary_final_mean_max.csv`.
+
+Initial interpretation:
+- PPO-ratio variants did not improve AAV or Pab1 overall.
+- Old replay-all weighted-NLL with negative_weight=0.25 remains strongest on AAV among tested policies.
+- Local latest-round weighted-NLL with negative_weight=0.25 produced the strongest Pab1 K=128 result in this sweep.
+- PPO diagnostics show high clip fractions and occasional very large ratios, especially with negative_weight=1.0 and replay-all, suggesting instability from the closer-to-original GRPO ratio objective in this masked-PLM setup.
+
+## 2026-07-11 - launched ProSST exploration sweep: multi-start and larger mask budgets
+
+Purpose:
+- Test whether early saturation is caused by weak exploration.
+- Keep the old FT policy fixed because PPO-ratio variants underperformed.
+- First-stage sweep varies multi-start and mask budget independently; combine winners after results.
+
+Code changes under test:
+- Added `--top_m_starts` to `run_zero_shot_prosst.py`.
+- Default `top_m_starts=1` preserves previous behavior.
+- For `top_m_starts>1`, generation cycles through the top m sequences in the current dataset and tracks which start produced each selected sequence for mask-reward updates.
+
+Output root:
+- `outputs/prosst_exploration_sweep_20260711/`
+
+Sweep grid:
+- Tasks: AAV, Pab1
+- Budgets: K=8, K=128
+- Seeds: 1-5
+- Total jobs: 80
+- Shared settings: ProSST 2048, restricted/cluster vocabulary, `mixed_explore_exploit`, batch size 64, n_iters=10, old weighted-NLL FT, replay-all, 5 epochs, lr=3e-5, lambda_KL=2, negative_weight=0.25, traces enabled.
+
+Variants:
+- `topm2_mask4`
+- `topm4_mask4`
+- `topm1_mask8`
+- `topm1_mask12`
+
+Execution strategy:
+- Dynamic shared queue with 6 tmux workers.
+- A6000 UUID `GPU-025e10e6-263f-d814-6dd5-added86fc8af`: 3 workers.
+- RTX 2080 Ti UUIDs `GPU-fcb13561-e5da-20e1-2ff7-a9bdbfa68c26`, `GPU-a3d54441-08da-ed66-fa0f-6aaaaf97baea`, `GPU-6faf056b-00ab-15fd-e25c-a149c7dcf3d7`: 1 worker each.
+
+Initial status:
+- Workers launched and visible in tmux.
+- All GPUs active.
+- Queue initially showed 6 claimed, 0 done, 0 failed.
+
+Completion update:
+- `outputs/prosst_exploration_sweep_20260711/` completed successfully.
+- Queue status: 80/80 jobs done, 0 failed.
+- Result files: 80 seed pickles present.
+- Summary CSV: `outputs/prosst_exploration_sweep_20260711/summary_final_mean_max.csv`.
+
+Initial interpretation:
+- Larger mask budgets (`mask_budget=8` and `mask_budget=12`) hurt strongly on AAV and Pab1.
+- `topm2_mask4` is the best exploration change among tested variants.
+- `topm2_mask4` gives a large improvement for Pab1 K=128 over old FT (`+0.148758`) and a tiny improvement for AAV K=8 (`+0.004275`).
+- `topm2_mask4` underperforms old FT for AAV K=128 (`-0.024618`).
+- `topm4_mask4` does not improve over old FT in this sweep.
+
+## ProSST candidate-pool and archive-diversity short sweep (2026-07-14)
+
+- Status: complete. Queue finished 36/36 jobs with 0 failures; all GPUs idle after completion.
+- Output root: `outputs/prosst_pool_archive_short_20260714/`.
+- Summary CSV: `outputs/prosst_pool_archive_short_20260714/summary_pool_archive_short.csv`.
+- Tasks: AMIE and TEM; oracle budget K=8; 5 optimization rounds; seeds 1-3.
+- Fine-tuning: established ProSST GRPO configuration (cluster vocabulary, mixed masking, mask budget 4, replay-all, 5 epochs, LR 3e-5, KL 2, negative weight 0.25).
+- Candidate-pool variants: 64 candidates (`pool1_q0`), 128 (`pool2_q0`), and 256 (`pool4_q0`) before globally selecting 8 oracle queries.
+- Archive-diversity variants: 256-candidate pool with exactly 1, 2, or 4 of 8 query slots selected greedily for maximum minimum Hamming distance from prior queries and already selected candidates (`pool4_q1`, `pool4_q2`, `pool4_q4`).
+- Required traces: enabled. These runs additionally record candidate-pool size, MMS rank, archive distance, and selection kind for every queried sequence.
+- Final mean max fitness after round 5: AMIE `pool1_q0` 0.232615 +/- 0.002818; `pool2_q0` 0.227769 +/- 0.003151; `pool4_q0` 0.227307 +/- 0.002084; `pool4_q1` 0.227693 +/- 0.001106; `pool4_q2` 0.228350 +/- 0.002235; `pool4_q4` 0.226400 +/- 0.002011.
+- Final mean max fitness after round 5: TEM `pool1_q0` 1.174751 +/- 0.037308; `pool2_q0` 1.180023 +/- 0.034307; `pool4_q0` 1.128596 +/- 0.024280; `pool4_q1` 1.098208 +/- 0.010657; `pool4_q2` 1.112449 +/- 0.018747; `pool4_q4` 1.135994 +/- 0.043422.
+- Runtime versus `pool1_q0`: AMIE `pool2_q0` 1.12x, `pool4_q0` 1.61x, `pool4_q1` 1.61x, `pool4_q2` 2.56x, `pool4_q4` 1.96x. TEM `pool2_q0` 1.19x, `pool4_q0` 1.72x, `pool4_q1` 1.22x, `pool4_q2` 0.93x, `pool4_q4` 1.49x. These timings are load-contaminated because multiple jobs shared GPUs.
+- Initial interpretation: 2x oversampling is modestly slower and gives a tiny TEM gain but not AMIE. 4x oversampling and archive-diversity quotas did not improve final max in this short sweep. Archive-diversity selected sequences were farther from the archive on average, but that extra distance did not translate into better fitness here.
+
+## 2026-07-15 - paper pipeline cleanup
+
+- Renamed the retained policy update to advantage-weighted masked fine-tuning. It uses standardized oracle advantages to weight masked-token reconstruction and is not presented as GRPO.
+- Kept the no-fine-tuning and restricted-versus-unrestricted vocabulary ablations in the reproduction recipe.
+- Removed unsuccessful PUCT/MCTS, PPO-ratio, multi-start, larger-mask, candidate-oversampling, archive-diversity, and alternate reward experiment code and dedicated outputs.
+- Historical entries above document why those approaches were rejected; they are not part of the active reproduction pipeline.
+
+## 2026-07-15 - publication plots regenerated
+
+- Regenerated the simplified K=8 and K=128 mean-max figures and the combined-budget figure from the complete reproduction results in `outputs/reproduction/grpo_reproduction_20260609/results/`.
+- Plot labels now describe the retained method as `0shotProt (w/ ProSST)`; GRPO-named plot folders were removed.
+- Regenerated restricted-versus-unrestricted vocabulary figures for both K=8 and K=128 from 5 seeds per landscape.
+- Regenerated epistasis figures from the reproduction epistasis JSON.
+- Regenerated 48 selected-candidate round-distribution figures: eight landscapes, K=8/K=128, and the advantage-weighted fine-tuning, no-fine-tuning, and unrestricted-vocabulary configurations.
+- Round-distribution figures use seed 1 so each row contains exactly the queried budget (`n=8` or `n=128`) rather than pooling five seeds.
+- Updated reproduction plotting to sanitize filenames, create output directories, use human-readable labels, and produce vocabulary plots for every requested budget.
