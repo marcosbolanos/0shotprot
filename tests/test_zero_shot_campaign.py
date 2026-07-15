@@ -1,6 +1,7 @@
 import numpy as np
+import torch
 
-from prospero.runners.run_zero_shot_prosst import CampaignState, known_wt_fitness
+from prospero.runners.run_zero_shot_prosst import AA20, CampaignState, ProSSTGenerator, known_wt_fitness
 
 
 class ReferenceDataset:
@@ -34,3 +35,36 @@ def test_campaign_keeps_wt_when_queries_are_worse():
 def test_offline_non_wt_sequences_are_not_excluded():
     campaign = CampaignState("AAA", 1.0)
     assert "AAC" not in campaign.excluded_sequences
+
+
+def make_mms_generator(logits):
+    generator = ProSSTGenerator.__new__(ProSSTGenerator)
+    generator.covered_length = logits.shape[1]
+    generator.full_ids = torch.arange(len(AA20))
+    generator.aa_index = {aa: idx for idx, aa in enumerate(AA20)}
+    generator._mms_cache = None
+    generator.logits_for_sequences = lambda sequences: logits
+    return generator
+
+
+def test_mms_sums_mutation_log_odds_from_fixed_incumbent_context():
+    logits = torch.zeros((1, 3, len(AA20)))
+    logits[0, 0, AA20.index("C")] = 2.0
+    logits[0, 1, AA20.index("D")] = 3.0
+    generator = make_mms_generator(logits)
+
+    scores = generator.marginal_mutation_scores("AAA", ["AAA", "CAA", "CDA"])
+
+    np.testing.assert_allclose(scores, [0.0, 2.0, 5.0], atol=1e-6)
+
+
+def test_mms_reuses_reference_logits_for_same_incumbent():
+    calls = []
+    logits = torch.zeros((1, 3, len(AA20)))
+    generator = make_mms_generator(logits)
+    generator.logits_for_sequences = lambda sequences: calls.append(sequences) or logits
+
+    generator.marginal_mutation_scores("AAA", ["CAA"])
+    generator.marginal_mutation_scores("AAA", ["ADA"])
+
+    assert calls == [["AAA"]]
