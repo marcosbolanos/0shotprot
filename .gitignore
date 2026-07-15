@@ -4,6 +4,7 @@ outputs/
 # Local experiment data and tool state
 external/
 oracles/
+runs.md
 .codex
 .codex/
 .mplconfig/
