@@ -1,77 +1,84 @@
-**Official implementation of "ProSpero: Active Learning for Robust Protein Design Beyond Wild-Type Neighborhoods" [NeurIPS 2025]** <br>
-[Paper link](https://arxiv.org/abs/2505.22494)
+# 0shotProt
 
-![](./pics/fig1.png)
+This repository contains the reproducible implementation and evaluation pipeline for 0shotProt, together with ProSpero and ProSST as pinned submodules.
 
-## Installation
-### Step 1: environment setup
-```
-conda env create -f environment.yml
-conda activate prospero_env
-pip install -e .
+## Experimental protocol
+
+0shotProt starts from a known wild-type sequence and its measured fitness. These form the experimental baseline. No other task-specific sequence or fitness value from the benchmark initialization set is available to optimization.
+
+Each round:
+
+1. masks four positions using positional feedback, middle-entropy exploration, and anti-collapse sampling;
+2. decodes candidates sequentially with ProSST;
+3. ranks candidates by sequential conditional log-odds relative to the current incumbent;
+4. queries the oracle for the top `K` candidates;
+5. optionally fine-tunes ProSST with signed advantage-weighted masked reconstruction and KL regularization;
+6. uses the best observed sequence, including the WT baseline, as the next incumbent.
+
+The supported 0shotProt configurations are:
+
+- fine-tuned ProSST with a charge-restricted decoding vocabulary;
+- no fine-tuning, as the primary ablation;
+- fine-tuned ProSST with an unrestricted 20-amino-acid vocabulary.
+
+## Setup
+
+```bash
+git clone --recurse-submodules <repository-url>
+cd ProSpero
+uv sync
 ```
 
-### Step 2: download oracles
-```
-chmod +x bash/*
+Download the benchmark oracles if they are not already present:
+
+```bash
 ./bash/download_oracles.sh
 ```
 
+ProSST structure tokens are expected under `outputs/prosst_structure_tokens/`.
 
-## Reproducing Paper's Results
+## Reproduction
 
-### Protein Fitness Optimization
-To reproduce the results of ProSpero across all the protein landscapes (Section 5.1 & Section 5.3) run:
-```
-./bash/run_all_landscapes.sh <path_to_results_dir>
-```
+Inspect every command without running it:
 
-### Noise Robustness Study
-To reproduce the results of ProSpero under the noisy surrogate setting (Section 5.4) run:
-```
-./bash/run_all_noise_levels.sh <path_to_results_dir>
+```bash
+uv run python scripts/reproduce.py --dry-run
 ```
 
-## Running a Single Task
-To run ProSpero on a single landscape run:
+Run the complete recipe on a GPU pinned by UUID:
 
+```bash
+uv run python scripts/reproduce.py \
+  --gpu GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```
-python ./src/prospero/runners/run_protein.py
+
+Useful filters:
+
+```bash
+uv run python scripts/reproduce.py \
+  --stages prosst_finetuned no_finetune \
+  --tasks AAV LGK \
+  --budgets 8 \
+  --seeds 1 2
 ```
-with following command-line parameters available (but not limited to):
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `--task` | str | – | Choices: 8 protein fitness landscapes + 3 covariate shifts on UBE2I|
-| `--results_dirpath` | str | – | Directory where results are saved|
-| `--n_queries` | int | `128` | Oracle per-round evaluation budget |
-| `--n_iters` | int | `10` | Number of active learning iterations |
-| `--full_deterministic` | flag | `false` | Enable deterministic behavior for reproducibility |
-| `--batch_size` | int | `256` | SMC batch size |
-| `--alphabet` | str | `CHARGE` | RAA used in the biologically-constrained SMC |
-| `--kappa_scan` | float | `1.0` | UCB exploitation-exploration hyperparam used in the targeted masking |
-| `--kappa_guidance` | float | `0.1` | UCB exploitation-exploration hyperparam used in the biologically-constrained SMC|
-| `--n_checks_multiplier` | int | `16` | Number of scans used in the targeted masking (in the paper denoted by "S") |
-| `--min_corruptions` | int | `3` | Minimum number of alanine substitutions in the targeted masking |
-| `--max_corruptions` | int | `10` | Maximum number of alanine substitutions in the targeted masking|
+Every run is written to `outputs/reproduction/<timestamp>/` with configuration, commands, logs, results, completion markers, traces, and generated plots.
 
+## Validation
 
-
-## Code referencing paper algorithms
-See `./src/prospero/inference.py` for code annotated with references to the paper's algorithms
-
-## Issue reporting
-If you encounter a problem or have a question, please either open an issue in this repository or email us at <michal.kmicikiewicz@helmholtz-munich.de>
-
-## Citation
-If you find this work useful, please cite:
-```bibtex
-@inproceedings{
-kmicikiewicz2025prospero,
-title={ProSpero: Active Learning for Robust Protein Design Beyond Wild-Type Neighborhoods},
-author={Michal Kmicikiewicz and Vincent Fortuin and Ewa Szczurek},
-booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
-year={2025},
-url={https://openreview.net/forum?id=wSDE3karoF}
-}
+```bash
+uv run pytest -q
+uv run pyright src/prospero/reproduction \
+  src/prospero/runners/run_zero_shot_prosst.py \
+  scripts/reproduce.py tests
 ```
+
+## Repository layout
+
+- `scripts/reproduce.py`: human-readable paper recipe.
+- `src/prospero/reproduction/`: command construction and orchestration.
+- `src/prospero/runners/`: experiment and plotting entry points.
+- `src/prospero/`: pinned ProSpero fork and 0shotProt implementation.
+- `src/prosst/`: pinned ProSST fork.
+- `datasets/`, `oracles/`: benchmark inputs.
+- `outputs/reproduction/`: timestamped experiment artifacts.
