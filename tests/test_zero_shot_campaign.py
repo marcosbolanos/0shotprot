@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from prospero.runners.run_zero_shot_prosst import AA20, CampaignState, ProSSTGenerator, known_wt_fitness
+from prospero.runners.run_zero_shot_evodiff import EvoDiffGenerator
 
 
 class ReferenceDataset:
@@ -68,3 +69,20 @@ def test_mms_reuses_reference_logits_for_same_incumbent():
     generator.marginal_mutation_scores("AAA", ["ADA"])
 
     assert calls == [["AAA"]]
+
+
+def test_evodiff_adapter_uses_fixed_incumbent_mms():
+    logits = torch.zeros((1, 3, len(AA20)))
+    logits[0, 0, AA20.index("C")] = 2.0
+    generator = EvoDiffGenerator.__new__(EvoDiffGenerator)
+    generator.covered_length = 3
+    generator.full_ids = torch.arange(len(AA20))
+    generator.aa_index = {aa: idx for idx, aa in enumerate(AA20)}
+    generator._mms_cache = None
+    generator.logits_for_sequences = lambda sequences: logits
+
+    np.testing.assert_allclose(
+        generator.marginal_mutation_scores("AAA", ["AAA", "CAA"]),
+        [0.0, 2.0],
+        atol=1e-6,
+    )
