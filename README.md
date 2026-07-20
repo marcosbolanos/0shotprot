@@ -9,15 +9,16 @@ This repository contains the reproducible implementation and evaluation pipeline
 Each round:
 
 1. masks four positions using positional feedback, middle-entropy exploration, and anti-collapse sampling;
-2. decodes candidates sequentially with ProSST;
+2. decodes candidates sequentially with a masked protein language model;
 3. ranks candidates by sequential conditional log-odds relative to the current incumbent;
 4. queries the oracle for the top `K` candidates;
-5. optionally fine-tunes ProSST with signed advantage-weighted masked reconstruction and KL regularization;
+5. optionally adapts the model with signed advantage-weighted masked reconstruction and KL regularization;
 6. uses the best observed sequence, including the WT baseline, as the next incumbent.
 
 The supported 0shotProt configurations are:
 
 - fine-tuned ProSST with a charge-restricted decoding vocabulary;
+- fine-tuned EvoDiff with the same optimization protocol;
 - no fine-tuning, as the primary ablation;
 - fine-tuned ProSST with an unrestricted 20-amino-acid vocabulary.
 
@@ -56,7 +57,7 @@ Useful filters:
 
 ```bash
 uv run python scripts/reproduce.py \
-  --stages prosst_finetuned no_finetune \
+  --stages prosst_online_adaptation prosst_without_adaptation \
   --tasks AAV LGK \
   --budgets 8 \
   --seeds 1 2
@@ -68,9 +69,8 @@ Every run is written to `outputs/reproduction/<timestamp>/` with configuration, 
 
 ```bash
 uv run pytest -q
-uv run pyright src/prospero/reproduction \
-  src/prospero/runners/run_zero_shot_prosst.py \
-  scripts/reproduce.py tests
+uv run ruff check scripts src/prospero tests
+uv run pyright
 ```
 
 ## Repository layout

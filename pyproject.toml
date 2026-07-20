@@ -7,25 +7,28 @@ name = "prospero"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "accelerate>=0.26.0",
     "biotite>=1.0.0",
-    "esm==3.2.3",
     "evodiff>=1.1.0",
-    "jaxtyping>=0.3.9",
     "matplotlib>=3.10.8",
     "numpy>=2.4.2",
-    "pyright>=1.1.408",
-    "pytest>=9.0.2",
+    "pandas>=2.3.3",
     "scikit-learn>=1.8.0",
-    "sentencepiece>=0.2.1",
-    "setuptools<82",
+    "scipy>=1.17.0",
     "tape-proteins",
-    "tiktoken>=0.12.0",
     "torch==2.5.1",
     "tqdm>=4.67.3",
-    "transformer-engine>=2.14.0",
     "transformers>=4.47,<4.48.2",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+exclude = ["src/prospero/experiments_config.py"]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "ruff>=0.15.22",
+]

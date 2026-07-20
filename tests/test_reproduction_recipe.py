@@ -1,7 +1,21 @@
-from pathlib import Path
-
-from prospero.reproduction.commands import alignment_commands, zero_shot_commands
-from prospero.reproduction.types import AlignmentStage, ReproductionContext, ZeroShotStage
+from prospero.reproduction.commands import (
+    optimization_commands,
+    plot_commands,
+    scoring_benchmark_commands,
+)
+from prospero.reproduction.types import (
+    DecodingVocabulary,
+    OnlineAdaptationConfig,
+    PlmOptimizationStage,
+    ProSperoStage,
+    ProteinLanguageModel,
+    ReproductionContext,
+    ScoringBenchmarkStage,
+)
+from prospero.runners.run_prosst_optimization import (
+    build_configs as build_prosst_configs,
+    get_parser as get_prosst_parser,
+)
 
 
 def context(tmp_path):
@@ -18,35 +32,70 @@ def context(tmp_path):
     )
 
 
-def test_evodiff_stage_uses_final_protocol_runner(tmp_path):
-    stage = ZeroShotStage(
-        name="evodiff_finetuned",
+def test_evodiff_stage_uses_shared_optimization_protocol(tmp_path):
+    stage = PlmOptimizationStage(
+        name="evodiff_online_adaptation",
         tasks=("AAV",),
-        plm="evodiff",
-        budgets=(8,),
+        model=ProteinLanguageModel.EVODIFF,
+        query_budgets=(8,),
         seeds=(1,),
-        finetune=True,
+        adaptation=OnlineAdaptationConfig(),
     )
 
-    [(name, command)] = zero_shot_commands(stage, context(tmp_path))
+    [(name, command)] = optimization_commands(stage, context(tmp_path))
 
-    assert name == "evodiff_finetuned_n8_AAV_seed1"
-    assert "prospero.runners.run_zero_shot_evodiff" in command
-    assert "--finetune_evodiff" in command
-    assert "--structure_tokens_dir" not in command
-    assert command[command.index("--finetune_lr") + 1] == "3e-05"
+    assert name == "evodiff_online_adaptation_k8_AAV_seed1"
+    assert "prospero.runners.run_evodiff_optimization" in command
+    assert "--online-adaptation" in command
+    assert "--structure-tokens-directory" not in command
+    assert command[command.index("--adaptation-learning-rate") + 1] == "3e-05"
 
 
-def test_alignment_stage_is_self_contained(tmp_path):
-    stage = AlignmentStage(tasks=("AAV",), max_sequences=128)
+def test_scoring_benchmark_stage_is_self_contained(tmp_path):
+    stage = ScoringBenchmarkStage(tasks=("AAV",), max_sequences=128)
 
-    [(name, command)] = alignment_commands(stage, context(tmp_path))
+    [(name, command)] = scoring_benchmark_commands(stage, context(tmp_path))
 
-    assert name == "plm_mms_pll_alignment"
-    assert "prospero.runners.run_plm_full_pll_alignment" in command
-    assert command[command.index("--max_sequences") + 1] == "128"
-    assert command[command.index("--plms") + 1 : command.index("--max_sequences")] == [
+    assert name == "plm_scoring_benchmark"
+    assert "prospero.runners.run_plm_scoring_benchmark" in command
+    assert command[command.index("--max-sequences") + 1] == "128"
+    assert command[
+        command.index("--models") + 1 : command.index("--max-sequences")
+    ] == [
         "evodiff",
         "esm",
         "prosst",
     ]
+
+
+def test_combined_plot_requires_both_query_budgets(tmp_path):
+    stages = [
+        ProSperoStage(tasks=("AAV",), query_budgets=(8,)),
+        PlmOptimizationStage(
+            name="prosst_online_adaptation",
+            tasks=("AAV",),
+            query_budgets=(8,),
+            seeds=(1,),
+        ),
+    ]
+
+    commands = plot_commands(stages, context(tmp_path))
+
+    assert "plot_main_optimization" not in {name for name, _ in commands}
+
+
+def test_no_adaptation_stage_cannot_load_adapted_model(tmp_path):
+    arguments = get_prosst_parser().parse_args(
+        [
+            "--results-directory",
+            str(tmp_path),
+            "--task",
+            "AAV",
+            "--decoding-vocabulary",
+            DecodingVocabulary.RESTRICTED.value,
+        ]
+    )
+
+    _, model_config = build_prosst_configs(arguments)
+
+    assert model_config.adaptation is None

@@ -1,7 +1,7 @@
 import pickle
 
 from prospero.experiments_config import WT_SEQUENCES
-from prospero.runners import plot_zero_shot_round_fitness_histograms as histograms
+from prospero.runners import plot_round_fitness_histograms as histograms
 
 
 def test_starting_fitness_uses_wt_and_online_queries_only(tmp_path, monkeypatch):

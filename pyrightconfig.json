@@ -1,0 +1,6 @@
+{
+  "include": ["scripts", "src/prospero", "tests"],
+  "exclude": ["outputs", "local", "src/prosst"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic"
+}

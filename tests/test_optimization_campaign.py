@@ -1,8 +1,12 @@
 import numpy as np
 import torch
 
-from prospero.runners.run_zero_shot_prosst import AA20, CampaignState, ProSSTGenerator, known_wt_fitness
-from prospero.runners.run_zero_shot_evodiff import EvoDiffGenerator
+from prospero.optimization.core import (
+    AMINO_ACIDS,
+    CampaignState,
+    SequenceGenerator,
+    load_wild_type_fitness,
+)
 
 
 class ReferenceDataset:
@@ -13,7 +17,7 @@ class ReferenceDataset:
 
 
 def test_known_wt_fitness_reads_only_explicit_baseline():
-    assert known_wt_fitness(ReferenceDataset(), "AAA") == 1.0
+    assert load_wild_type_fitness(ReferenceDataset(), "AAA") == 1.0
 
 
 def test_campaign_uses_only_wt_and_online_queries():
@@ -38,20 +42,30 @@ def test_offline_non_wt_sequences_are_not_excluded():
     assert "AAC" not in campaign.excluded_sequences
 
 
+class FixedLogitModel(SequenceGenerator):
+    def __init__(self, logits):
+        self.covered_length = logits.shape[1]
+        self.full_ids = torch.arange(len(AMINO_ACIDS))
+        self.aa_index = {
+            amino_acid: index for index, amino_acid in enumerate(AMINO_ACIDS)
+        }
+        self._initialize_search_state()
+        self.logits = logits
+        self.calls = []
+
+    def logits_for_sequences(self, sequences):
+        self.calls.append(sequences)
+        return self.logits
+
+
 def make_mms_generator(logits):
-    generator = ProSSTGenerator.__new__(ProSSTGenerator)
-    generator.covered_length = logits.shape[1]
-    generator.full_ids = torch.arange(len(AA20))
-    generator.aa_index = {aa: idx for idx, aa in enumerate(AA20)}
-    generator._mms_cache = None
-    generator.logits_for_sequences = lambda sequences: logits
-    return generator
+    return FixedLogitModel(logits)
 
 
 def test_mms_sums_mutation_log_odds_from_fixed_incumbent_context():
-    logits = torch.zeros((1, 3, len(AA20)))
-    logits[0, 0, AA20.index("C")] = 2.0
-    logits[0, 1, AA20.index("D")] = 3.0
+    logits = torch.zeros((1, 3, len(AMINO_ACIDS)))
+    logits[0, 0, AMINO_ACIDS.index("C")] = 2.0
+    logits[0, 1, AMINO_ACIDS.index("D")] = 3.0
     generator = make_mms_generator(logits)
 
     scores = generator.marginal_mutation_scores("AAA", ["AAA", "CAA", "CDA"])
@@ -60,26 +74,19 @@ def test_mms_sums_mutation_log_odds_from_fixed_incumbent_context():
 
 
 def test_mms_reuses_reference_logits_for_same_incumbent():
-    calls = []
-    logits = torch.zeros((1, 3, len(AA20)))
+    logits = torch.zeros((1, 3, len(AMINO_ACIDS)))
     generator = make_mms_generator(logits)
-    generator.logits_for_sequences = lambda sequences: calls.append(sequences) or logits
 
     generator.marginal_mutation_scores("AAA", ["CAA"])
     generator.marginal_mutation_scores("AAA", ["ADA"])
 
-    assert calls == [["AAA"]]
+    assert generator.calls == [["AAA"]]
 
 
-def test_evodiff_adapter_uses_fixed_incumbent_mms():
-    logits = torch.zeros((1, 3, len(AA20)))
-    logits[0, 0, AA20.index("C")] = 2.0
-    generator = EvoDiffGenerator.__new__(EvoDiffGenerator)
-    generator.covered_length = 3
-    generator.full_ids = torch.arange(len(AA20))
-    generator.aa_index = {aa: idx for idx, aa in enumerate(AA20)}
-    generator._mms_cache = None
-    generator.logits_for_sequences = lambda sequences: logits
+def test_shared_model_interface_uses_incumbent_mms():
+    logits = torch.zeros((1, 3, len(AMINO_ACIDS)))
+    logits[0, 0, AMINO_ACIDS.index("C")] = 2.0
+    generator = FixedLogitModel(logits)
 
     np.testing.assert_allclose(
         generator.marginal_mutation_scores("AAA", ["AAA", "CAA"]),
