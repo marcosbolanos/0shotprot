@@ -1,6 +1,6 @@
 # 0shotProt
 
-This repository contains the reproducible implementation and evaluation pipeline for 0shotProt, together with ProSpero and ProSST as pinned submodules.
+This archive contains the reproducible implementation and evaluation pipeline for 0shotProt.
 
 ## Experimental protocol
 
@@ -25,18 +25,20 @@ The supported 0shotProt configurations are:
 ## Setup
 
 ```bash
-git clone --recurse-submodules <repository-url>
-cd ProSpero
+unzip 0shotProt-code.zip
+cd 0shotProt-code
 uv sync
 ```
 
 Download the benchmark oracles if they are not already present:
 
 ```bash
-./bash/download_oracles.sh
+bash bash/download_oracles.sh
 ```
 
-ProSST structure tokens are expected under `outputs/prosst_structure_tokens/`.
+The ProSST structure tokens used by the eight benchmark tasks are included under
+`assets/prosst_structure_tokens/`. Model weights are downloaded automatically
+by their respective libraries on first use.
 
 ## Reproduction
 
@@ -78,7 +80,7 @@ uv run pyright
 - `scripts/reproduce.py`: human-readable paper recipe.
 - `src/prospero/reproduction/`: command construction and orchestration.
 - `src/prospero/runners/`: experiment and plotting entry points.
-- `src/prospero/`: pinned ProSpero fork and 0shotProt implementation.
-- `src/prosst/`: pinned ProSST fork.
+- `src/prospero/`: ProSpero benchmark code and the 0shotProt implementation.
 - `datasets/`, `oracles/`: benchmark inputs.
+- `assets/prosst_structure_tokens/`: precomputed ProSST inputs for the benchmark tasks.
 - `outputs/reproduction/`: timestamped experiment artifacts.

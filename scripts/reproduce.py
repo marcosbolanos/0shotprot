@@ -18,7 +18,7 @@ from prospero.reproduction.cli import parse_runtime_options
 TASKS = ("AAV", "LGK", "GFP", "Pab1", "AMIE", "E4B", "TEM", "UBE2I")
 SEEDS = (1, 2, 3, 4, 5)
 QUERY_BUDGETS = (8, 128)
-STRUCTURE_TOKENS = "outputs/prosst_structure_tokens"
+STRUCTURE_TOKENS = "assets/prosst_structure_tokens"
 
 ONLINE_ADAPTATION = OnlineAdaptationConfig(
     epochs=5,
